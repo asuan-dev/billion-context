@@ -184,12 +184,12 @@ export function hasCompressSettings(s: CompressSettings): boolean {
   *  - `minCompressRangeChars` (deprecated alias: `minCompressRange`) →
   *    `compress.minCompressRange`. The unit is characters.
   *  - `tiers` → `tiers.enabled`.
-   *  - `absorb` → `absorb` (kernel AbsorbConfig; unset fields inherit the
-   *    kernel DEFAULT_ABSORB_CONFIG, so a partial user block still resolves
-   *    fully). Absent `s.absorb` leaves `base.absorb` untouched — the feature
-   *    stays off unless some level enables it.
-   *  - `rules` → `rules = { enabled }` (kernel RuleFeatureConfig; limits stay
-   *    at kernel defaults). Absent `s.rules` leaves `base.rules` untouched. */
+  *  - `absorb` → `absorb` (kernel AbsorbConfig; unset fields inherit the
+  *    kernel DEFAULT_ABSORB_CONFIG, so a partial user block still resolves
+  *    fully). Absent `s.absorb` leaves `base.absorb` untouched — the feature
+  *    stays off unless some level enables it.
+  *  - `rules` → `rules = { enabled }` (kernel RuleFeatureConfig; limits stay
+  *    at kernel defaults). Absent `s.rules` leaves `base.rules` untouched. */
 export function applyCompressSettings(base: Config, limit: number, s: CompressSettings): Config {
     const nudge = { ...base.nudge };
     const truncate = { ...base.truncate };
