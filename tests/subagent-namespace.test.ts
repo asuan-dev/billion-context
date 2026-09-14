@@ -2,12 +2,19 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { defaultConfig } from "acp-kernel";
+import { createCore, defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { subagentNamespace, deriveMessageId } from "acp-kernel/wire";
+import { subagentNamespace, deriveMessageId, responsesToCore } from "acp-kernel/wire";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { getSession, snapshotMessages, _resetSessionsForTest, flushAllSessions } from "../src/session.ts";
+import { recordPluginSession, flushConversations, loadConversations, _resetPluginStateForTest } from "../src/plugin.ts";
+import { applyRanges } from "../src/stream.ts";
+import { parseCompressInput } from "../src/compress-tool.ts";
 
 function listen(server: http.Server): Promise<void> {
     if (server.listening) return Promise.resolve();
@@ -132,6 +139,7 @@ test("e2e #150: guardian subagent request bypasses the main session's compressio
         model: "gpt-guard-e2e",
         stream: true,
         session_id: SESSION_ID,
+        prompt_cache_key: SESSION_ID,
         instructions: "You are Codex, the main coding agent.",
         input: [
             { type: "message", role: "user", content: MAIN_TURN_1 },
@@ -148,6 +156,7 @@ test("e2e #150: guardian subagent request bypasses the main session's compressio
         model: "gpt-guard-e2e",
         stream: true,
         session_id: SESSION_ID,
+        prompt_cache_key: SESSION_ID,
         instructions: "You are Guardian, the Codex approval reviewer. Evaluate the proposed action against the user authorization.",
         input: [
             { type: "message", role: "user", content: "Approval request: exec command proposed by the main agent." },
@@ -184,5 +193,132 @@ test("e2e #150: guardian subagent request bypasses the main session's compressio
     } finally {
         await close(proxy);
         await close(upstream);
+    }
+});
+
+test("e2e #739: registered omp restores mapped blocks from disk across instructions drift", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-resume-"));
+    const previousStateHome = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = root;
+    const store = new SessionStore({ dir: path.join(root, "sessions"), enabled: true, debounceMs: 0 });
+    _setStoreForTest(store);
+    _resetSessionsForTest();
+    _resetPluginStateForTest();
+    setRegistryForTest({});
+
+    const bodies: string[] = [];
+    const upstream = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (chunk: Buffer) => chunks.push(chunk));
+        req.on("end", () => {
+            bodies.push(Buffer.concat(chunks).toString("utf8"));
+            res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+            res.write(textEvents("ok"));
+            res.write(completed(120));
+            res.end();
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await listen(upstream);
+    const upstreamAddr = upstream.address();
+    if (upstreamAddr === null || typeof upstreamAddr === "string") throw new Error("upstream did not listen on tcp");
+    const upstreamPort = upstreamAddr.port;
+
+    const opts: ProxyOptions = {
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: {
+            [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-reg-e2e": { context: 400_000 } } },
+        },
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000, { preserveRecentTokens: 0 }),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts);
+    await listen(proxy);
+    const proxyAddr = proxy.address();
+    if (proxyAddr === null || typeof proxyAddr === "string") throw new Error("proxy did not listen on tcp");
+    const proxyPort = proxyAddr.port;
+    const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`;
+    const SESSION_ID = "e2e-launcher-sess";
+    const LEGACY_ID = `${SESSION_ID}|sub:legacy`;
+    const bodyWith = (instructions: string) => ({
+        model: "gpt-reg-e2e",
+        stream: true,
+        session_id: SESSION_ID,
+        instructions,
+        input: [
+            { type: "message", role: "user", content: "run the task" },
+            ...Array.from({ length: 6 }, (_, i) => ({ type: "message", role: i % 2 === 0 ? "assistant" : "user", content: `OLD_RAW_${i} ${"history ".repeat(1000)}` })),
+            ...Array.from({ length: 5 }, (_, i) => ({ type: "message", role: i % 2 === 0 ? "assistant" : "user", content: `recent turn ${i}` })),
+        ],
+    });
+
+    try {
+        const reg = await fetch(`http://127.0.0.1:${proxyPort}/__bili/plugin/register`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ conversationId: SESSION_ID, agent: "omp", identity: true }),
+        });
+        assert.equal(reg.status, 200, "launcher registration accepted");
+
+        const r1 = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(bodyWith("You are Pi, the omp launcher coding agent.")) });
+        assert.equal(r1.status, 200);
+        await r1.text();
+
+        const legacy = getSession(LEGACY_ID);
+        legacy.state = getSession(SESSION_ID).state;
+        legacy.metadata.pluginAgent = "omp";
+        const messages = responsesToCore(bodyWith("original instructions")).msgs;
+        snapshotMessages(legacy, messages);
+        const compressed = applyRanges(parseCompressInput({ content: [1, 3, 5].map((i) => ({
+            startId: legacy.state.messageRefs.byRaw[messages[i]!.id],
+            endId: legacy.state.messageRefs.byRaw[messages[i + 1]!.id],
+            summary: `RESTORED_SUMMARY_${i}: historical work was completed and its results remain available in this summary.`,
+        })) }), { core: createCore(), config: opts.kernelConfig, messages, session: legacy, log: () => {} });
+        assert.doesNotMatch(compressed, /FAILED/);
+        assert.equal(legacy.state.blocks.filter((block) => block.active).length, 3, compressed);
+        await store.writeNow(legacy);
+        recordPluginSession(SESSION_ID, LEGACY_ID);
+        flushConversations();
+        _resetSessionsForTest();
+        _resetPluginStateForTest();
+        loadConversations();
+
+        // No fresh registration: recover ownership and all three blocks from
+        // the persisted mapping, including a session absent from memory.
+        const r2 = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(bodyWith("You are Pi, switched to a different model with a rewritten system prompt.")) });
+        assert.equal(r2.status, 200);
+        await r2.text();
+
+        const status = await (await fetch(`http://127.0.0.1:${proxyPort}/__bili/plugin/status?conversationId=${SESSION_ID}`)).json();
+        assert.equal(status.pluginAgent, "omp");
+        assert.equal(status.blocks.filter((block: { active: boolean }) => block.active).length, 3);
+        assert.doesNotMatch(bodies[1]!, /OLD_RAW_/);
+        assert.ok(bodies[1]!.length < bodies[0]!.length / 2, "restored blocks shrink the actual upstream payload");
+        const stats = await (await fetch(`http://127.0.0.1:${proxyPort}/__bili/stats`)).json();
+        const mine = stats.sessions.filter((s: { id: string }) => s.id === SESSION_ID || s.id.startsWith(`${SESSION_ID}|`));
+        assert.equal(bodies.length, 2, "two rounds, no extra compress re-requests");
+        assert.equal(mine.length, 1, "instructions drift must NOT fork a registered conversation into a second namespace");
+        assert.equal(mine[0].id, LEGACY_ID, "resume reuses the mapped state rather than a fresh bare-id session");
+    } finally {
+        await close(proxy);
+        await close(upstream);
+        await flushAllSessions();
+        flushConversations();
+        _resetSessionsForTest();
+        _resetPluginStateForTest();
+        _setStoreForTest(new SessionStore({ enabled: false }));
+        if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = previousStateHome;
+        rmSync(root, { recursive: true, force: true });
     }
 });

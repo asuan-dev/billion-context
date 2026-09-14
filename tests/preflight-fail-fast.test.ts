@@ -355,3 +355,84 @@ test("e2e #470: system + tools overhead counts in the preflight trigger — text
         await once(upstream, "close");
     }
 });
+
+// A retry must advance through the remaining original history, including its
+// soft-protected tail, without folding turns appended after the failure.
+test("e2e #739: failed preflight resumes within its watermark without repeating completed chunks", async () => {
+    const calls: Call[] = [];
+    // Summarizer: first (non-stream) call 429s — request 1's preflight fails
+    // and pins. Later summarizer calls succeed — request 2's pinned retry.
+    let summaryCalls = 0;
+    const upstream = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            let parsed: { stream?: boolean } = {};
+            try { parsed = JSON.parse(raw); } catch { /* keep {} */ }
+            calls.push({ stream: !!parsed.stream, body: raw });
+            if (parsed.stream) {
+                res.writeHead(200, { "content-type": "text/event-stream" });
+                res.end(okSse(1000));
+            } else {
+                summaryCalls++;
+                if (summaryCalls === 1) {
+                    res.writeHead(429, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ error: { message: "rate limited", type: "rate_limit_error" } }));
+                } else {
+                    res.writeHead(200, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ content: [{ type: "text", text: "SUMMARY: the large recent user message was a deterministic load-growth payload; its raw content is no longer needed." }] }));
+                }
+            }
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = upstream.address().port;
+
+    const proxy = await startProxy(upstreamPort, { "claude-small": { context: 10_000 }, "claude-smaller": { context: 8_000 } }, { preserveRecentMessages: 10 });
+    await once(proxy, "listening");
+    const proxyPort = proxy.address().port;
+
+    try {
+        // Request 1: ~13k history vs a 10k window — preflight fires, its
+        // summarization call 429s, the proxy fails fast (and pins).
+        const r1 = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "preflight-pin-sess" },
+            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: bigConversation() }),
+        });
+        assert.equal(r1.status, 503, "request 1 fails fast when the summary upstream rate-limits");
+        assert.equal(calls.filter((c) => c.stream).length, 0, "request 1 forwarded nothing");
+        assert.ok(calls.filter((c) => !c.stream).length >= 1, "request 1 attempted the (429'd) summarization call");
+
+        // Request 2: same session, history GREW during the failure window (a
+        // new tail turn). A different model dodges the #301 dead-end cooldown
+        // (same model+window would fail fast on the cached diagnosis without
+        // reaching the pinned retry) — simulating the post-cooldown retry.
+        const grown = [...bigConversation(), { role: "user", content: `FAILURE_WINDOW_NOISE ${"noise_".repeat(200)}` }];
+        const r2 = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "preflight-pin-sess" },
+            body: JSON.stringify({ model: "claude-smaller", max_tokens: 1024, stream: true, messages: grown }),
+        });
+        assert.equal(r2.status, 200, "request 2's pinned retry compresses and forwards");
+        const summarizers = calls.filter((c) => !c.stream);
+        assert.ok(summarizers.length >= 2, "request 2 ran the pinned summarization call");
+        const successful = summarizers.slice(1);
+        assert.ok(successful.some((c) => c.body.includes("Message 7 of the long conversation.")), "retry reaches the original soft-protected history");
+        for (let i = 0; i < 12; i++) {
+            assert.ok(successful.filter((c) => c.body.includes(`Message ${i} of the long conversation.`)).length <= 1, `message ${i} is not summarized again after a successful fold`);
+        }
+        const firstRetry = summarizers[1]?.body ?? "";
+        assert.ok(firstRetry.includes("Message 0 of the long conversation."), "the retry compresses the pinned (original) range");
+        assert.ok(summarizers.every((c) => !c.body.includes("FAILURE_WINDOW_NOISE")), "the failure-window turn stayed OUT of every compression input");
+        assert.equal(calls.filter((c) => c.stream).length, 1, "request 2's folded payload was forwarded upstream");
+        assert.ok(calls.find((c) => c.stream)!.body.includes("FAILURE_WINDOW_NOISE"), "the appended user turn remains visible rather than being lost");
+    } finally {
+        proxy.close();
+        await once(proxy, "close");
+        upstream.close();
+        await once(upstream, "close");
+    }
+});

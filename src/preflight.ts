@@ -56,6 +56,15 @@ export const MAX_SUMMARY_CALLS_PER_PREFLIGHT = 16;
 // incident class behind #868 (a 1.39x-window payload); it is a fixed depth,
 // not scaled to the overshoot — scaling it is a separate design question.
 
+// Freeze the original history boundary, not a worklist: every successful fold
+// changes which ranges remain viable. Failure-window turns stay outside it.
+function readPreflightPin(metadata: Record<string, unknown>): string | undefined {
+    const pin = metadata.preflightPin;
+    if (typeof pin !== "object" || pin === null) return undefined;
+    const endRef = (pin as Record<string, unknown>).endRef;
+    return typeof endRef === "string" && /^m\d+$/.test(endRef) ? endRef : undefined;
+}
+
 export type PreflightProtocol = "anthropic" | "openai" | "responses";
 
 export interface PreflightDeps {
@@ -701,6 +710,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     let target = Math.min(limit, deps.compressionTarget ?? limit);
     const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: estimateCoreMessages(messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0), rangesRemaining: 0, fitsWindow: true };
     if (limit <= 0) return result;
+    let watermark = readPreflightPin(deps.session.metadata);
     const budget = Math.max(MIN_CHUNK_TOKENS, Math.floor(limit * CHUNK_FRACTION));
     // applyCompression rejects ranges below config.compress.minCompressRange
     // chars, so never spend a summarization call on a chunk that can't apply.
@@ -772,7 +782,20 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         result.payloadEstimate = estimateCoreMessages(turn.messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0);
         if (startTokens < 0) startTokens = currentTokens;
         if (currentTokens < target) break;
-        const ranges = viableRanges(turn.nudge?.compressibleRanges ?? []);
+        const maps = refMaps(messages, deps.session.state);
+        if (!watermark) {
+            for (const ref of maps.idxToRef.values()) {
+                if (!watermark || refNum(ref) > refNum(watermark)) watermark = ref;
+            }
+        }
+        const boundary = refNum(watermark ?? "");
+        let endRef: string | undefined;
+        for (const ref of maps.idxToRef.values()) {
+            if (refNum(ref) <= boundary && (!endRef || refNum(ref) > refNum(endRef))) endRef = ref;
+        }
+        const ranges = viableRanges(turn.nudge?.compressibleRanges ?? [])
+            .filter((range) => endRef !== undefined && refNum(range.startRef) <= boundary)
+            .map((range) => ({ startRef: range.startRef, endRef: refNum(range.endRef) > boundary ? endRef! : range.endRef }));
         rangesRemaining = ranges.length;
         if (ranges.length === 0) {
             // #330: nothing foldable outside the soft-protected recent zone.
@@ -808,9 +831,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             if (budgetHit) break;
             const skipKey = `${range.startRef}:${range.endRef}`;
             if (skipSet.has(skipKey)) continue;
-            const { refToIdx } = refMaps(messages, deps.session.state);
-            const startIdx = refToIdx.get(range.startRef);
-            const endIdx = refToIdx.get(range.endRef);
+            const startIdx = maps.refToIdx.get(range.startRef);
+            const endIdx = maps.refToIdx.get(range.endRef);
             if (startIdx === undefined || endIdx === undefined || startIdx > endIdx) {
                 skipSet.add(skipKey);
                 continue;
@@ -836,7 +858,6 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 const span = spans.pop();
                 if (!span) break;
                 const [cs, ce] = span;
-                const maps = refMaps(messages, deps.session.state);
                 const startRef = maps.idxToRef.get(cs);
                 const endRef = maps.idxToRef.get(ce);
                 if (!startRef || !endRef) continue;
@@ -1008,6 +1029,12 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             failure = { kind: "exhausted", detail: `the compress budget was exhausted after ${MAX_PREFLIGHT_ROUNDS} rounds${unusableNote}` };
         }
     }
+    result.fitsWindow = baselineKnown ? result.payloadEstimate < limit : finalUpper < limit;
+    if (result.fitsWindow) {
+        delete deps.session.metadata.preflightPin;
+    } else if (failure && failure.kind !== "aborted" && watermark) {
+        deps.session.metadata.preflightPin = { endRef: watermark };
+    }
     if (result.compressedRanges > 0) {
         // #857: never persist the IMAGE FLOOR into the usage baseline — images
         // are billed by the upstream and every fit/clamp gate adds their
@@ -1024,6 +1051,5 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     result.rangesRemaining = rangesRemaining;
     result.savedTokens = Math.max(0, startTokens - currentTokens);
     if (currentTokens >= limit) result.failure = failure;
-    result.fitsWindow = baselineKnown ? result.payloadEstimate < limit : finalUpper < limit;
     return result;
 }

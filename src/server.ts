@@ -77,7 +77,7 @@ import { emitPreflightError, emitStreamError } from "./stream-error.js";
 import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
-import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRuntimeInfoFor, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
+import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRuntimeInfoFor, recordPluginSession, registeredPluginSessionId, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageTotals, type WireProtocol } from "./util.js";
@@ -1187,29 +1187,29 @@ async function handle(
                   parsed as { prompt_cache_key?: unknown },
               )
             : undefined;
-        const conversation = protocol === "anthropic"
-            ? // #970: a subagent's conversation value gets its own
-              // `<id>|sub:<agent-id>` namespace so it lands on its own session
-              // (own lock chain, own compression state) instead of queueing
-              // behind the main turn. The identity itself is NOT rewritten:
-              // affinityToken/clientLabel below keep consuming the raw value
-              // so upstream prefix caches and the UI label stay continuous
-              // across main and subagent sessions.
-              (claudeSub !== undefined && opts.subagentSplit !== false
-                  ? claudeSubagentSplit(anthropicIdentity?.value ?? anthropicSignal, req.headers, systemTextsForSplit)
-                  : anthropicIdentity?.value ?? anthropicSignal)
-            : protocol === "openai"
-              ? openaiIdentity?.value ?? openaiSignal
-              : codexTurn
-                // Trusted Codex turn id enters the verbatim session chain
-                // directly — do NOT route it through subagentNamespace (the
-                // kernel's empty-instructions non-anchoring path is left
-                // untouched for metadata-less clients).
-                ? codexTurn.value
-                : subagentNamespace(
-                      responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
-                      (parsed as ResponsesRequestBody).instructions,
-                  );
+        const bodyIdentity = responsesIdentity ?? openaiIdentity ?? anthropicIdentity;
+        const registeredSessionId = !codexTurn && bodyIdentity?.clientProvided
+            ? registeredPluginSessionId(bodyIdentity.value)
+            : undefined;
+        const conversation = codexTurn?.value ?? registeredSessionId ?? (
+            protocol === "anthropic"
+                ? // #970: a subagent's conversation value gets its own
+                  // `<id>|sub:<agent-id>` namespace so it lands on its own session
+                  // (own lock chain, own compression state) instead of queueing
+                  // behind the main turn. The identity itself is NOT rewritten:
+                  // affinityToken/clientLabel below keep consuming the raw value
+                  // so upstream prefix caches and the UI label stay continuous
+                  // across main and subagent sessions.
+                  (claudeSub !== undefined && opts.subagentSplit !== false
+                      ? claudeSubagentSplit(anthropicIdentity?.value ?? anthropicSignal, req.headers, systemTextsForSplit)
+                      : anthropicIdentity?.value ?? anthropicSignal)
+                : protocol === "openai"
+                  ? openaiIdentity?.value ?? openaiSignal
+                  : subagentNamespace(
+                        responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
+                        (parsed as ResponsesRequestBody).instructions,
+                    )
+        );
         // The session ID is the client-provided conversation value VERBATIM —
         // no hash, no protocol/credential/upstream dimensions (#286): those
         // are all mutable mid-conversation (bearer rotation, relay switching,
@@ -1267,7 +1267,6 @@ async function handle(
         //    body.session_id) — never the synthetic one — so a user can tell
         //    at a glance which client owns a session. pi sends nothing, so its
         //    label stays empty (shown as "—" in the UI).
-        const bodyIdentity = responsesIdentity ?? openaiIdentity ?? anthropicIdentity;
         const affinity = affinityToken(bodyIdentity ?? {
             value: clientConv ?? conversation,
             source: clientConv ? "header" : "generated",
@@ -1297,10 +1296,11 @@ async function handle(
         // race-free. Fall back to the headless pending queue (codex spawn)
         // for the first request that creates a new session.
         if (!pluginAgent && !anonAffinity) {
-            const identityAgent = consumePluginRegisterFor(clientConv ?? conversation);
+            const identityConversation = registeredSessionId ? bodyIdentity!.value : clientConv ?? conversation;
+            const identityAgent = consumePluginRegisterFor(identityConversation);
             if (identityAgent) {
                 pluginAgent = identityAgent;
-                pluginConversation = clientConv ?? conversation;
+                pluginConversation = identityConversation;
             }
         }
         if (!pluginAgent && session.stats.requests === 0 && codexTurnIdentity(req.headers) === undefined && claudeSub === undefined) {
@@ -1316,7 +1316,7 @@ async function handle(
             }
         }
         if (!pluginAgent && typeof session.metadata.pluginAgent === "string") pluginAgent = session.metadata.pluginAgent;
-        if (pluginAgent && !pluginConversation) pluginConversation = conversation;
+        if (pluginAgent && !pluginConversation) pluginConversation = registeredSessionId ? bodyIdentity!.value : conversation;
         if (pluginAgent) {
             if (session.metadata.pluginAgent !== pluginAgent) session.metadata.pluginAgent = pluginAgent;
             // #970: for a split subagent session, record it under its split

@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import type { ServerResponse } from "node:http";
 import fs from "node:fs";
 import path from "node:path";
-import { acquireInFlight, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
+import { acquireInFlight, effectiveConfig, findSessionByCanonicalId, getSession, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
 import { ABSORB_TOOL, ABSORB_TOOL_NAME, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES, SEARCH_CONTEXT_CONVERSATION_ID_PARAM, SEARCH_CONTEXT_TOOL_NAME } from "./compress-tool.js";
 import { effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { executeProxyTool } from "./loop/core.js";
@@ -238,6 +238,16 @@ export function recordPluginSession(conversationId: string, sessionId: string): 
         if (oldest !== undefined) conversations.delete(oldest);
     }
     scheduleSaveConversations();
+}
+
+/** Omp assigns each subagent its own UUID; a plain prompt_cache_key does not.
+ *  Reuse the mapped session, including an existing |sub: namespace, rather
+ *  than creating an empty bare-id session when the model changes. */
+export function registeredPluginSessionId(conversationId: string): string | undefined {
+    const mappedId = conversations.get(conversationId)?.sessionId;
+    const mapped = mappedId ? getSession(mappedId) : undefined;
+    const agent = registeredIds.get(conversationId) ?? mapped?.metadata.pluginAgent;
+    return agent === "omp" ? mappedId ?? conversationId : undefined;
 }
 
 /** Keep the last prepare()'s view for a plugin session so tool-API execution
