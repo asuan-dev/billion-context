@@ -3,7 +3,7 @@ import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
-import { acquireInFlight, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
+import { acquireInFlight, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
 import { ABSORB_TOOL, ABSORB_TOOL_NAME, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { executeProxyTool } from "./loop/core.js";
@@ -319,16 +319,54 @@ export function handlePluginCompact(payload: string, res: import("node:http").Se
         res.end(JSON.stringify({ ok: false, error: "conversationId is required" }));
         return;
     }
-    const entry = conversations.get(conversationId);
-    const session = entry ? peekSession(entry.sessionId) : undefined;
-    if (!entry || !session) {
+    const { session, entry } = resolveConversation(conversationId);
+    // #760: the verbatim-id fallback above can resolve a session with NO map
+    // entry (first call), so only the session itself gates execution.
+    if (!session) {
         res.writeHead(404, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "unknown plugin conversation (no model request has arrived with this conversation id yet)" }));
+        res.end(JSON.stringify({
+            ok: false,
+            error: entry
+                ? `unknown plugin conversation id "${conversationId}" (id registered but session not resident)`
+                : `unknown plugin conversation id "${conversationId}" (no model request has arrived with this conversation id yet)`,
+        }));
         return;
     }
     markCompactionBoundary(session);
-    entry.lastSeen = Date.now();
+    if (entry) entry.lastSeen = Date.now();
     res.end(JSON.stringify({ ok: true, conversationId }));
+}
+
+// #760: per-call conversation_id for MCP tools. Hosts that share ONE shim
+// process across several concurrent conversations have no env/meta session
+// channel, so the model supplies the target conversation per call (the proxy
+// prints its own session id in the wire notes). The param is added to CLONED
+// schemas only — wire-mode injection serves the kernel constants directly and
+// those models are routed by request identity, not arguments.
+const CONVERSATION_ID_PARAM = {
+    type: "string" as const,
+    description:
+        "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). " +
+        "Pass it on every call when your host shares one MCP process across several concurrent conversations; " +
+        "omit it when the host bound the session itself.",
+};
+
+function withConversationIdParam(tool: unknown): unknown {
+    const copy = structuredClone(tool);
+    if (!copy || typeof copy !== "object") return copy;
+    const t = copy as Record<string, unknown>;
+    const add = (schema: unknown): void => {
+        if (!schema || typeof schema !== "object") return;
+        const s = schema as { properties?: Record<string, unknown> };
+        s.properties = { ...(s.properties ?? {}), conversation_id: CONVERSATION_ID_PARAM };
+    };
+    if (t.input_schema !== undefined) add(t.input_schema);
+    else {
+        const fn = t.function;
+        if (fn && typeof fn === "object") add((fn as { parameters?: unknown }).parameters);
+        else add(t.parameters);
+    }
+    return copy;
 }
 
 export function handlePluginManifest(res: import("node:http").ServerResponse): void {
@@ -345,9 +383,9 @@ export function handlePluginManifest(res: import("node:http").ServerResponse): v
         // manifest has no request context to know which route will win.
         toolNames: [...PROXY_TOOL_NAMES, ABSORB_TOOL_NAME],
         tools: {
-            anthropic: [...ACP_TOOLS_ANTHROPIC, ABSORB_TOOL],
-            openai: [...ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI],
-            responses: [...ACP_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES],
+            anthropic: [...ACP_TOOLS_ANTHROPIC, ABSORB_TOOL].map(withConversationIdParam),
+            openai: [...ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI].map(withConversationIdParam),
+            responses: [...ACP_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES].map(withConversationIdParam),
         },
         headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER },
         toolEndpoint: "/__bili/plugin/tool",
@@ -379,14 +417,32 @@ function conversationIdForSession(sessionId: string): string | undefined {
     return bestId;
 }
 
+/** Resolve a caller-supplied conversation id to a resident session through every
+ *  known channel, in precedence order: (1) the persisted conversation→session map
+ *  (plugin binding / prior calls), (2) the verbatim session id (#760 — the id IS
+ *  the client-provided conversation value), (3) the proxy-derived canonical pfa-*
+ *  alias (#760b — every session exposes a stable canonical id the model echoes
+ *  back from the wire notes). Paths 2/3 record the resolved mapping so later
+ *  calls hit path 1 directly. Read-only w.r.t. creation: an unknown id finds
+ *  nothing and creates nothing. */
+function resolveConversation(conversationId: string): { session: Session | undefined; entry?: ConversationEntry } {
+    const entry = conversations.get(conversationId);
+    let session = entry ? peekSession(entry.sessionId) : undefined;
+    if (!session) {
+        session = peekSession(conversationId) ?? findSessionByCanonicalId(conversationId);
+        if (session) recordPluginSession(conversationId, session.id);
+    }
+    return { session, entry };
+}
+
 /** Context-level visibility for plugin UIs (status bars / slash commands):
  *  the same usage the nudge decision sees, keyed by conversation id. */
 export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false): void {
-    let entry = conversations.get(conversationId);
-    let session = entry ? peekSession(entry.sessionId) : undefined;
+    const { session: resolvedSession, entry } = resolveConversation(conversationId);
+    let session = resolvedSession;
     let viaFallback = false;
     let resolvedConversationId = conversationId;
-    if ((!entry || !session) && fallbackLatest) {
+    if (!session && fallbackLatest) {
         // #404: only sessions with real activity in THIS process qualify.
         // Before the fix every boot-restored session carried lastSeen =
         // restore time, so a 245-way tie resolved by insertion (readdir)
@@ -501,9 +557,10 @@ export async function handlePluginTool(
         res.end(JSON.stringify({ ok: false, error: `conversationId is required (send the same value as the ${PLUGIN_CONVERSATION_HEADER} header)` }));
         return;
     }
-    const entry = conversations.get(conversationId);
-    const session = entry ? peekSession(entry.sessionId) : undefined;
-    if (!entry || !session) {
+    const { session, entry } = resolveConversation(conversationId);
+    // #760: the verbatim-id fallback above can resolve a session with NO map
+    // entry (first call), so only the session itself gates execution.
+    if (!session) {
         // #656: two distinct failures shared one message before. An id that was
         // NEVER registered is the classic stale-shim-id case (host resumed its
         // session after the MCP shim captured CLAUDE_CODE_SESSION_ID) — say so,
@@ -528,8 +585,12 @@ export async function handlePluginTool(
         res.end(JSON.stringify({ ok: false, error: `unknown tool "${tool}" (expected one of: ${allowed.join(", ")})` }));
         return;
     }
-    entry.lastSeen = Date.now();
-    const args = parsed.args && typeof parsed.args === "object" ? (parsed.args as Record<string, unknown>) : {};
+    if (entry) entry.lastSeen = Date.now();
+    const args = parsed.args && typeof parsed.args === "object" ? { ...(parsed.args as Record<string, unknown>) } : {};
+    // #760: the MCP manifest advertises an optional conversation_id argument
+    // for per-call routing; routing itself uses the body-level conversationId
+    // field, so strip it before kernel arg parsing sees it.
+    delete args.conversation_id;
     const callId = `plugin_${Date.now().toString(36)}`;
     acquireInFlight(session);
     let result: string;
@@ -557,13 +618,23 @@ export async function handlePluginTool(
         return;
     }
     releaseInFlight(session);
+    // #760b: evidence-based plugin-mode flip. A successful MCP tool execution proves
+    // this session's host owns the bili compression tools, so bind it to plugin mode
+    // (sticky) — the next model request stops injecting the duplicate ephemeral wire
+    // tools. Guarded: only flips a session with NO existing agent binding, never
+    // overriding a pi/omp/opencode plugin or a launcher-registered agent.
+    if (typeof session.metadata.pluginAgent !== "string") {
+        session.metadata.pluginAgent = "mcp";
+    }
     markDirty(session);
     deps.log("info", `[${session.id}] [plugin] tool ${tool} executed via plugin (${result.length} chars)`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, tool, conversationId, result }));
 }
 
-type UsageSample = { inputTokens?: number; cachedTokens?: number; outputTokens?: number };
+// creationTokens = Anthropic cache-write segment (cache_creation_input_tokens):
+// part of the context size, but NOT a cache hit (#790).
+type UsageSample = { inputTokens?: number; cachedTokens?: number; outputTokens?: number; creationTokens?: number };
 
 function num(v: unknown): number | undefined {
     return typeof v === "number" && Number.isFinite(v) ? v : undefined;
@@ -574,9 +645,17 @@ function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefine
     if (type === "message_start") {
         const usage = (obj["message"] as Record<string, unknown> | undefined)?.["usage"] as Record<string, unknown> | undefined;
         if (!usage) return undefined;
+        // Per-field snapshot (#790): a zero is a real value here (a fully
+        // cache-hit turn reports input_tokens: 0), so record whatever is
+        // present and let later events overwrite field by field.
+        const sample: UsageSample = {};
         const input = num(usage["input_tokens"]);
-        if (input === undefined) return undefined;
-        return { inputTokens: input, cachedTokens: num(usage["cache_read_input_tokens"]) };
+        if (input !== undefined) sample.inputTokens = input;
+        const read = num(usage["cache_read_input_tokens"]);
+        if (read !== undefined) sample.cachedTokens = read;
+        const creation = num(usage["cache_creation_input_tokens"]);
+        if (creation !== undefined) sample.creationTokens = creation;
+        return Object.keys(sample).length > 0 ? sample : undefined;
     }
     if (type === "message_delta") {
         const usage = obj["usage"] as Record<string, unknown> | undefined;
@@ -584,10 +663,20 @@ function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefine
         // Some relays echo `input_tokens: 0` in message_delta (the field is
         // normally absent — message_start is authoritative for the input size,
         // which is fixed within a turn). A 0 here is never a legitimate new
-        // value; merging it would zero acc.inputTokens (set by message_start)
-        // and collapse lastInputTokens to the cached portion only.
+        // value; merging it would zero out acc.inputTokens (set by message_start)
+        // and collapse lastInputTokens to the cached portion only. The same
+        // guard covers the cache segments (#790): a zeroed echo must not
+        // clobber real values carried from message_start.
         const input = num(usage["input_tokens"]);
-        return { inputTokens: input && input > 0 ? input : undefined, outputTokens: num(usage["output_tokens"]) };
+        const read = num(usage["cache_read_input_tokens"]);
+        const creation = num(usage["cache_creation_input_tokens"]);
+        const sample: UsageSample = {};
+        if (input !== undefined && input > 0) sample.inputTokens = input;
+        if (read !== undefined && read > 0) sample.cachedTokens = read;
+        if (creation !== undefined && creation > 0) sample.creationTokens = creation;
+        const output = num(usage["output_tokens"]);
+        if (output !== undefined) sample.outputTokens = output;
+        return Object.keys(sample).length > 0 ? sample : undefined;
     }
     if (type === "response.completed") {
         const usage = (obj["response"] as Record<string, unknown> | undefined)?.["usage"] as Record<string, unknown> | undefined;
@@ -603,7 +692,9 @@ function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefine
         return {
             inputTokens: num(usage["prompt_tokens"]),
             outputTokens: num(usage["completion_tokens"]),
-            cachedTokens: num((usage["prompt_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]),
+            // DeepSeek-style upstreams report KV-cache hits as top-level
+            // prompt_cache_hit_tokens instead of the standard details field (#779).
+            cachedTokens: num((usage["prompt_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]) ?? num(usage["prompt_cache_hit_tokens"]),
         };
     }
     return undefined;
@@ -612,15 +703,23 @@ function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefine
 export function applyUsageSample(session: Session, sample: UsageSample, protocol?: WireProtocol): void {
     // inputTokens is protocol-native: Anthropic reports it NEW-only (cached
     // separate); OpenAI/Responses report the TOTAL (cached already included).
-    // promptInputTotal adds the cached segment back when it is not part of
-    // inputTokens — including the #408 split-semantics violation on OpenAI
-    // wires (prompt_tokens < cached_tokens → cached is NOT included).
-    if (sample.cachedTokens !== undefined) {
+    // promptInputTotal adds back every segment not part of inputTokens —
+    // cached, plus the Anthropic cache-write segment under split semantics
+    // (#408/#790). Cache writes count toward context size, never toward hits.
+    const total = sample.inputTokens !== undefined ? promptInputTotal(protocol, sample.inputTokens, sample.cachedTokens, sample.creationTokens) : 0;
+    // #793: a zero-total input sample carries no information — every real
+    // request has input tokens, so this is a gateway placeholder (message_start
+    // 0s) or a relay echo settled before the authoritative usage arrived
+    // (typically on client abort mid-stream). Adopting it would clobber the
+    // last trusted lastInputTokens with 0 and freeze nudge at 0%.
+    if (sample.inputTokens !== undefined && total <= 0) {
+        loggerLog("warn", `[${session.id}] [plugin] skipped zero-total usage sample (placeholder/echo) — keeping lastInputTokens=${session.stats.lastInputTokens}`);
+    }
+    if (sample.cachedTokens !== undefined && total > 0) {
         session.stats.cachedTokens += sample.cachedTokens;
         session.stats.cacheSamples += 1;
     }
-    if (sample.inputTokens !== undefined) {
-        const total = promptInputTotal(protocol, sample.inputTokens, sample.cachedTokens);
+    if (sample.inputTokens !== undefined && total > 0) {
         session.stats.inputTokens += total;
         // Net out pending compress savings (see stream.ts applyRanges): plugin
         // compress tool results shrink the next request, not this report.
@@ -628,7 +727,7 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
         warnCacheCollapse(session, total, sample.cachedTokens ?? 0);
         // #695: per-request parity with the wire path's [acp-usage] — without
         // this, post-fold cache cliffs cannot be attributed from logs.
-        const hit = sample.cachedTokens === undefined || total <= 0 ? undefined : Math.round((100 * (sample.cachedTokens ?? 0)) / total);
+        const hit = sample.cachedTokens === undefined ? undefined : Math.round((100 * (sample.cachedTokens ?? 0)) / total);
         const foldNew = session.stats.pendingFoldUsage === true;
         if (foldNew) session.stats.pendingFoldUsage = false;
         loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} cached=${sample.cachedTokens ?? "n/a"}${hit === undefined ? "" : ` (cache hit ${hit}%)`}${foldNew ? " fold=new" : ""}`);
@@ -644,6 +743,7 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
 function mergeUsageSample(acc: UsageSample, sample: UsageSample): void {
     if (sample.inputTokens !== undefined) acc.inputTokens = sample.inputTokens;
     if (sample.cachedTokens !== undefined) acc.cachedTokens = sample.cachedTokens;
+    if (sample.creationTokens !== undefined) acc.creationTokens = sample.creationTokens;
     if (sample.outputTokens !== undefined) acc.outputTokens = sample.outputTokens;
 }
 
@@ -730,7 +830,7 @@ export async function pipePluginChatWithStrip(
     // before any prose, and dropping it froze lastInputTokens at the previous
     // turn's value, corrupting every later nudge decision.
     const settleUsage = () => {
-        if (session && (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined)) {
+        if (session && (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined || acc.creationTokens !== undefined)) {
             applyUsageSample(session, acc, protocol);
             markDirty(session);
         }
@@ -1242,7 +1342,10 @@ export async function pipePluginJson(
                     cachedTokens:
                         num((usage["prompt_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]) ??
                         num((usage["input_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]) ??
-                        num(usage["cache_read_input_tokens"]),
+                        num(usage["cache_read_input_tokens"]) ??
+                        // #779: DeepSeek-style top-level field (openai wire)
+                        num(usage["prompt_cache_hit_tokens"]),
+                    creationTokens: num(usage["cache_creation_input_tokens"]),
                 }, protocol);
                 markDirty(session);
             }

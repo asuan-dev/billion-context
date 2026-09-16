@@ -226,6 +226,23 @@ test("#408: pipePluginChatWithStrip — split-semantics openai usage keeps lastI
     });
 });
 
+test("#779: pipePluginChatWithStrip — DeepSeek top-level prompt_cache_hit_tokens counted (openai SSE)", async () => {
+    await withTempStore("pipe-ds-sse", async (_dir, store) => {
+        _setStoreForTest(store);
+        const session = makeSession("pipe-ds-sse");
+        const chunks: Buffer[] = [];
+        const res = makeRes(chunks);
+        const stream = streamOf([
+            `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: "Hi" } }] })}\n\n`,
+            `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", choices: [], usage: { prompt_tokens: 42, completion_tokens: 7, total_tokens: 49, prompt_cache_hit_tokens: 30 } })}\n\n`,
+            "data: [DONE]\n\n",
+        ]);
+        await pipePluginChatWithStrip(stream, res, "openai", session);
+        assert.equal(session.stats.cachedTokens, 30, "DeepSeek hit tokens counted");
+        assert.equal(session.stats.cacheSamples, 1, "cache sample recorded");
+    });
+});
+
 test("#660: pipePluginResponsesWithStrip — response.completed usage forwarded verbatim", async () => {
     await withTempStore("pipe-resp", async (_dir, store) => {
         _setStoreForTest(store);
@@ -260,6 +277,26 @@ test("#660: pipePluginJson — openai JSON usage forwarded verbatim", async () =
         assert.equal(json.usage.prompt_tokens, 60000);
         assert.equal(json.usage.total_tokens, 60005);
         assert.equal(session.stats.lastInputTokens, 60000);
+    });
+});
+
+test("#779: pipePluginJson — DeepSeek top-level prompt_cache_hit_tokens counted (openai JSON)", async () => {
+    await withTempStore("pipe-ds-json", async (_dir, store) => {
+        _setStoreForTest(store);
+        const session = makeSession("pipe-ds-json");
+        const chunks: Buffer[] = [];
+        const res = makeRes(chunks);
+        const body = JSON.stringify({
+            id: "c1",
+            object: "chat.completion",
+            created: 1,
+            model: "deepseek-chat",
+            choices: [{ index: 0, message: { role: "assistant", content: "Hi" }, finish_reason: "stop" }],
+            usage: { prompt_tokens: 42, completion_tokens: 7, total_tokens: 49, prompt_cache_hit_tokens: 30 },
+        });
+        await pipePluginJson(streamOf([body]), res, session, "openai");
+        assert.equal(session.stats.cachedTokens, 30, "DeepSeek hit tokens counted");
+        assert.equal(session.stats.cacheSamples, 1, "cache sample recorded");
     });
 });
 
@@ -912,4 +949,193 @@ test("#645/#660: codex UA client (responses wire) reports folded usage verbatim"
         assert.ok(!h.bodies[h.bodies.length - 1]!.includes("SENTINEL_FOLD_GONE"), "post-fold upstream body must not carry the folded head content");
         assert.equal(completedUsageOf(raw).input_tokens, 1000, "codex (UA) must report the folded request's own provider-measured usage — no baseline backfill (#645/#660)");
     });
+});
+
+// #790: Anthropic input context = fresh(input_tokens) + read(cache_read_input_tokens)
+// + write(cache_creation_input_tokens); total context size is the sum, but the
+// cache HIT is the read segment only. The plugin SSE/JSON paths and the loop
+// adapter dropped the read segment from message_delta and never counted the
+// write segment, so a turn whose full usage arrived in message_delta was
+// reported as input=344 cached=0 instead of input=56040 cached=53696.
+
+test("#790: promptInputTotal — anthropic cache-write segment is additive under split semantics", () => {
+    assert.equal(promptInputTotal("anthropic", 344, 53696, 2000), 56040);
+    assert.equal(promptInputTotal("anthropic", 0, 56000, 0), 56000);
+    assert.equal(promptInputTotal("anthropic", 1000, undefined, 2000), 3000);
+    assert.equal(promptInputTotal(undefined, 1000, 40000, 500), 41500);
+    // openai/responses report TOTAL-includes-cached → creation must NOT be added back
+    assert.equal(promptInputTotal("openai", 41000, 40000, undefined), 41000);
+    assert.equal(promptInputTotal("responses", 41000, 40000, 500), 41000);
+});
+
+const A_SSE = (type: string, data: unknown): string => `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+const A_TEXT_BLOCK = [
+    A_SSE("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+    A_SSE("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } }),
+    A_SSE("content_block_stop", { type: "content_block_stop", index: 0 }),
+].join("");
+
+test("#790: plugin SSE — zero message_start + full usage in message_delta counts all three segments", async () => {
+    await withTempStore("p790-repro", async (_dir, store) => {
+        _setStoreForTest(store);
+        const session = makeSession("p790-repro");
+        const chunks: Buffer[] = [];
+        const res = makeRes(chunks);
+        const stream = streamOf([
+            A_SSE("message_start", { type: "message_start", message: { id: "msg_1", type: "message", role: "assistant", content: [], usage: { input_tokens: 0, output_tokens: 0 } } }),
+            A_TEXT_BLOCK,
+            A_SSE("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 344, cache_read_input_tokens: 53696, cache_creation_input_tokens: 2000, output_tokens: 5 } }),
+            A_SSE("message_stop", { type: "message_stop" }),
+        ]);
+        await pipePluginChatWithStrip(stream, res, "anthropic", session);
+        const out = chunks.join("");
+        // 344 fresh + 53696 read + 2000 write = 56040; hit = read only
+        assert.equal(session.stats.lastInputTokens, 56040);
+        assert.equal(session.stats.inputTokens, 56040);
+        assert.equal(session.stats.cachedTokens, 53696);
+        assert.equal(session.stats.outputTokens, 5);
+        assert.ok(out.includes('"cache_read_input_tokens":53696'), `forwarded bytes must keep the original usage frame: ${out}`);
+        assert.ok(out.includes('"cache_creation_input_tokens":2000'), out);
+    });
+});
+
+test("#790: plugin SSE — real shape (start carries all three, delta carries output only)", async () => {
+    await withTempStore("p790-real", async (_dir, store) => {
+        _setStoreForTest(store);
+        const session = makeSession("p790-real");
+        const chunks: Buffer[] = [];
+        const res = makeRes(chunks);
+        const stream = streamOf([
+            A_SSE("message_start", { type: "message_start", message: { id: "msg_1", type: "message", role: "assistant", content: [], usage: { input_tokens: 2344, cache_read_input_tokens: 50000, cache_creation_input_tokens: 2000, output_tokens: 1 } } }),
+            A_TEXT_BLOCK,
+            A_SSE("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } }),
+            A_SSE("message_stop", { type: "message_stop" }),
+        ]);
+        await pipePluginChatWithStrip(stream, res, "anthropic", session);
+        assert.equal(session.stats.lastInputTokens, 54344, "2344 + 50000 + 2000");
+        assert.equal(session.stats.cachedTokens, 50000);
+    });
+});
+
+test("#790: plugin SSE — repeated identical snapshots do not accumulate", async () => {
+    await withTempStore("p790-repeat", async (_dir, store) => {
+        _setStoreForTest(store);
+        const session = makeSession("p790-repeat");
+        const chunks: Buffer[] = [];
+        const res = makeRes(chunks);
+        const usage = { input_tokens: 100, cache_read_input_tokens: 50, cache_creation_input_tokens: 10 };
+        const stream = streamOf([
+            A_SSE("message_start", { type: "message_start", message: { id: "msg_1", type: "message", role: "assistant", content: [], usage: { ...usage, output_tokens: 1 } } }),
+            A_TEXT_BLOCK,
+            A_SSE("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { ...usage, output_tokens: 5 } }),
+            A_SSE("message_stop", { type: "message_stop" }),
+        ]);
+        await pipePluginChatWithStrip(stream, res, "anthropic", session);
+        assert.equal(session.stats.lastInputTokens, 160, "per-field overwrite: counted once, not 320");
+        assert.equal(session.stats.inputTokens, 160);
+    });
+});
+
+test("#790: plugin SSE — relay zero-echo in message_delta must not clobber start values", async () => {
+    await withTempStore("p790-zeroecho", async (_dir, store) => {
+        _setStoreForTest(store);
+        const session = makeSession("p790-zeroecho");
+        const chunks: Buffer[] = [];
+        const res = makeRes(chunks);
+        const stream = streamOf([
+            A_SSE("message_start", { type: "message_start", message: { id: "msg_1", type: "message", role: "assistant", content: [], usage: { input_tokens: 100, cache_read_input_tokens: 50, cache_creation_input_tokens: 10, output_tokens: 1 } } }),
+            A_TEXT_BLOCK,
+            A_SSE("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 5 } }),
+            A_SSE("message_stop", { type: "message_stop" }),
+        ]);
+        await pipePluginChatWithStrip(stream, res, "anthropic", session);
+        assert.equal(session.stats.lastInputTokens, 160);
+        assert.equal(session.stats.cachedTokens, 50);
+    });
+});
+
+test("#790: plugin SSE — fully cache-hit turn reports the read segment as its size", async () => {
+    await withTempStore("p790-hit", async (_dir, store) => {
+        _setStoreForTest(store);
+        const session = makeSession("p790-hit");
+        const chunks: Buffer[] = [];
+        const res = makeRes(chunks);
+        const stream = streamOf([
+            A_SSE("message_start", { type: "message_start", message: { id: "msg_1", type: "message", role: "assistant", content: [], usage: { input_tokens: 0, cache_read_input_tokens: 56000, output_tokens: 1 } } }),
+            A_TEXT_BLOCK,
+            A_SSE("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } }),
+            A_SSE("message_stop", { type: "message_stop" }),
+        ]);
+        await pipePluginChatWithStrip(stream, res, "anthropic", session);
+        assert.equal(session.stats.lastInputTokens, 56000, "input_tokens:0 is a real value at start and must not drop the sample");
+        assert.equal(session.stats.cachedTokens, 56000);
+    });
+});
+
+test("#790: plugin JSON — anthropic body counts all three segments; openai total semantics unchanged", async () => {
+    await withTempStore("p790-json", async (_dir, store) => {
+        _setStoreForTest(store);
+        const anthro = makeSession("p790-json-a");
+        const chunksA: Buffer[] = [];
+        const resA = makeRes(chunksA);
+        const bodyA = JSON.stringify({
+            id: "msg_1", type: "message", role: "assistant", model: "m", content: [{ type: "text", text: "hi" }], stop_reason: "end_turn",
+            usage: { input_tokens: 344, cache_read_input_tokens: 53696, cache_creation_input_tokens: 2000, output_tokens: 5 },
+        });
+        await pipePluginJson(streamOf([bodyA]), resA, anthro, "anthropic");
+        assert.equal(anthro.stats.lastInputTokens, 56040);
+        assert.equal(anthro.stats.cachedTokens, 53696);
+        assert.ok(chunksA.join("").includes('"cache_creation_input_tokens":2000'));
+
+        const openai = makeSession("p790-json-o");
+        const chunksO: Buffer[] = [];
+        const resO = makeRes(chunksO);
+        const bodyO = JSON.stringify({
+            id: "c1", object: "chat.completion", created: 1, model: "m", choices: [{ index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" }],
+            usage: { prompt_tokens: 41000, completion_tokens: 5, total_tokens: 41005, prompt_tokens_details: { cached_tokens: 40000 } },
+        });
+        await pipePluginJson(streamOf([bodyO]), resO, openai, "openai");
+        assert.equal(openai.stats.lastInputTokens, 41000, "prompt_tokens is already the total — no double count");
+        assert.equal(openai.stats.cachedTokens, 40000);
+    });
+});
+
+async function drainAnthropicLoop(body: string, id: string): Promise<ReturnType<typeof makeCtx>> {
+    const ctx = makeCtx(id, [textMsg("raw_1", "user", "hello")]);
+    for await (const chunk of runCompressLoop(
+        streamOf([body]),
+        { ...ctx, protocol: "anthropic" },
+        { model: "m", input: [] },
+        { url: "https://upstream.test/v1/messages", headers: {} },
+        createAnthropicAdapter({ model: "m" }),
+        "",
+    )) {
+        void chunk;
+    }
+    return ctx;
+}
+
+test("#790: loop (proxy mode) — anthropic adapter counts all three segments from message_start", async () => {
+    const body =
+        A_SSE("message_start", { type: "message_start", message: { id: "msg_1", type: "message", role: "assistant", content: [], usage: { input_tokens: 344, cache_read_input_tokens: 53696, cache_creation_input_tokens: 2000, output_tokens: 1 } } }) +
+        A_TEXT_BLOCK +
+        A_SSE("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } }) +
+        A_SSE("message_stop", { type: "message_stop" });
+    const ctx = await drainAnthropicLoop(body, "loop-790-start");
+    assert.equal(ctx.session.stats.lastInputTokens, 56040);
+    assert.equal(ctx.session.stats.inputTokens, 56040);
+    assert.equal(ctx.session.stats.cachedTokens, 53696);
+    assert.equal(ctx.session.stats.cacheSamples, 1);
+    assert.equal(ctx.session.stats.outputTokens, 5);
+});
+
+test("#790: loop (proxy mode) — complete usage in message_delta adopts all three atomically", async () => {
+    const body =
+        A_SSE("message_start", { type: "message_start", message: { id: "msg_1", type: "message", role: "assistant", content: [], usage: { input_tokens: 0, output_tokens: 1 } } }) +
+        A_TEXT_BLOCK +
+        A_SSE("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 344, cache_read_input_tokens: 53696, cache_creation_input_tokens: 2000, output_tokens: 5 } }) +
+        A_SSE("message_stop", { type: "message_stop" });
+    const ctx = await drainAnthropicLoop(body, "loop-790-delta");
+    assert.equal(ctx.session.stats.lastInputTokens, 56040);
+    assert.equal(ctx.session.stats.cachedTokens, 53696);
 });

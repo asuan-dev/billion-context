@@ -481,7 +481,33 @@ test("/acp command warns when no proxy is detected", async () => {
         await cmd.handler("", ctx);
         assert.equal(notes.length, 1);
         assert.equal(notes[0]!.type, "warning");
+        // #788: neutral wording — offers BOTH exits (proxy mode or remove the
+        // plugin) instead of assuming proxy intent.
         assert.match(notes[0]!.msg, /no proxy detected/);
+        assert.match(notes[0]!.msg, /run via `bili pi` \(or set a \/bili\/ baseURL\) to use proxy mode/);
+        assert.match(notes[0]!.msg, /`bili plugin remove pi`/);
+        assert.match(notes[0]!.msg, /billion-context-pi/);
+    });
+});
+
+test("/acp no-proxy warning offers the remove exit for omp without billion-context-pi mention", async () => {
+    await withEnv({ BILLION_CONTEXT_PROXY: undefined }, async () => {
+        const pi = makeFakePi();
+        ompPlugin(pi as never);
+        const cmd = pi.commands.get("acp")!;
+        const notes: Array<{ msg: string; type?: string }> = [];
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess" },
+            model: { baseUrl: "https://api.example.com/v1" },
+            ui: { notify: (msg: string, type?: string) => notes.push({ msg, type }) },
+        };
+        await cmd.handler("", ctx);
+        assert.equal(notes.length, 1);
+        assert.equal(notes[0]!.type, "warning");
+        assert.match(notes[0]!.msg, /no proxy detected/);
+        assert.match(notes[0]!.msg, /run via `bili omp`/);
+        assert.match(notes[0]!.msg, /`bili plugin remove omp`/);
+        assert.doesNotMatch(notes[0]!.msg, /billion-context-pi/);
     });
 });
 
@@ -706,11 +732,15 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
     await withEnv(hintEnv(home, piAgentDir), async () => {
         const root = selfPackageRoot();
 
-        assert.match(pluginInstall("pi"), /installed/);
+        const freshInstall = pluginInstall("pi");
+        assert.match(freshInstall, /installed/);
+        assert.doesNotMatch(freshInstall, /replaced existing entries/);
         const piSettings = JSON.parse(fs.readFileSync(path.join(piAgentDir, "settings.json"), "utf8")) as { packages: string[] };
         assert.ok(piSettings.packages.includes(root));
         assert.match(pluginInstall("pi"), /already installed/);
-        assert.match(pluginRemove("pi"), /removed/);
+        const firstRemove = pluginRemove("pi");
+        assert.match(firstRemove, /removed/);
+        assert.ok(firstRemove.includes(root), "remove reports the entry it dropped");
         assert.ok(!(JSON.parse(fs.readFileSync(path.join(piAgentDir, "settings.json"), "utf8")) as { packages: string[] }).packages.includes(root));
         assert.match(pluginRemove("pi"), /not installed/);
 
@@ -728,11 +758,28 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
             ],
             theme: "dark",
         }, null, 2));
-        assert.match(pluginInstall("pi"), /installed/);
+        const replaceMsg = pluginInstall("pi");
+        assert.match(replaceMsg, /installed/);
+        // #788: every dropped entry is named in the output — the
+        // billion-context-pi removal in particular must not be silent.
+        assert.ok(replaceMsg.includes("replaced existing entries:"));
+        for (const gone of [
+            "npm:billion-context-pi",
+            "npm:billion-context-pi@0.1.48",
+            "npm:billion-context@0.1.40",
+            "/home/x/projects/billion-context",
+            "C:\\Users\\x\\AppData\\Roaming\\npm\\node_modules\\billion-context-pi",
+        ]) {
+            assert.ok(replaceMsg.includes(gone), `install output names removed entry ${gone}`);
+        }
+        assert.doesNotMatch(replaceMsg, /other-package/);
         const replaced = JSON.parse(fs.readFileSync(path.join(piAgentDir, "settings.json"), "utf8")) as { packages: string[]; theme: string };
         assert.deepEqual(replaced.packages, ["/home/x/other-package", root]);
         assert.equal(replaced.theme, "dark");
-        assert.match(pluginRemove("pi"), /removed/);
+        const legacyRemove = pluginRemove("pi");
+        assert.match(legacyRemove, /removed/);
+        assert.ok(legacyRemove.includes(root), "remove reports the entry it dropped");
+        assert.doesNotMatch(legacyRemove, /other-package/);
         assert.deepEqual((JSON.parse(fs.readFileSync(path.join(piAgentDir, "settings.json"), "utf8")) as { packages: string[] }).packages, ["/home/x/other-package"]);
 
         // omp install/status/remove verify the entry's target exists, so

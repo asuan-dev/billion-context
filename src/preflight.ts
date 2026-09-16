@@ -8,6 +8,7 @@ import {
     type PackSurface,
 } from "acp-kernel";
 import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.js";
+import { IMAGE_PLACEHOLDER, imagePlaceholders } from "./image-note.js";
 import { applyAbsorbView } from "./absorb.js";
 import { applyRanges, type RewriteCtx } from "./stream.js";
 import { fetchWithRetry, UpstreamHttpError } from "./fetch-util.js";
@@ -39,6 +40,8 @@ export interface PreflightDeps {
     core: CompressionCore;
     session: Session;
     config: Config;
+    /** Best-effort target below the hard window; never relax recent protection for headroom alone. */
+    compressionTarget?: number;
     prompts: Prompts;
     surface?: PackSurface;
     protocol: PreflightProtocol;
@@ -188,7 +191,16 @@ function renderRange(messages: CoreMessage[], startIdx: number, endIdx: number):
     const parts: string[] = [];
     for (let i = startIdx; i <= endIdx && i < messages.length; i++) {
         const m = messages[i];
-        const text = (m.text ?? "").trim();
+        let text = (m.text ?? "").trim();
+        // #781: images live in BiliMessage sidecars, invisible to m.text — emit
+        // one explicit placeholder each so summaries record them instead of
+        // losing them silently. Replaces the codec's bare "[image]" literal
+        // (anthropic) with the richer media-type/dimension note.
+        const notes = imagePlaceholders(m);
+        if (notes.length > 0) {
+            const note = notes.join(" ");
+            text = text === IMAGE_PLACEHOLDER ? note : text ? `${text}\n${note}` : note;
+        }
         if (!text) continue;
         const label =
             m.contentType === "tool-call"
@@ -303,14 +315,41 @@ function summaryHeaders(deps: PreflightDeps): Record<string, string> {
     return headers;
 }
 
-// Extract the summary text from a buffered SSE body (the streaming twin of
-// extractSummaryText). For Responses, prefer the response.completed event's
-// full response object (reuses the JSON extractor); otherwise accumulate
-// output_text deltas. Non-conforming upstreams that return plain JSON despite
-// stream:true are handled by the caller's JSON fallback.
-function extractSummaryFromSse(protocol: PreflightProtocol, text: string): string {
+// #780: extraction carries a validity contract — it must separate "the stream
+// delivered a complete summary" from "the stream died mid-delivery". The naive
+// accumulator conflated the two: a gateway truncation (#764: half-line data,
+// no [DONE]) left a partial `out` that was persisted as a complete tier-1
+// summary — silently worse than an empty one, because #727's diagnosis chain
+// only fires on empty results. Rejection rules:
+//   - a data line that fails to parse is corruption (badFrame), not noise to skip
+//   - failure terminals (response.incomplete/.failed/.error, generic error /
+//     bare {error}) invalidate any text accumulated before them
+//   - responses requires the spec-mandatory response.completed terminal; its
+//     response object reuses the JSON extractor and is authoritative — once
+//     seen it is trusted as-is (no framing check on top, so gateways that close
+//     right after the final event without a trailing blank line are safe)
+//   - anthropic/openai do NOT require finish_reason/[DONE]/message_stop (#764:
+//     real gateways omit these occasionally); the body must at least end on a
+//     frame boundary (\n\n, CRLF-tolerant), else it may have been cut mid-frame
+// A rejected stream returns "" so requestSummary routes it into
+// diagnoseEmptySummary + the #726 halving/cooldown chain.
+export function extractSummaryFromSse(protocol: PreflightProtocol, text: string): string {
+    const framed = /\r?\n\r?\n$/.test(text);
     let out = "";
+    let terminalText = "";
+    let completed = false;
+    let invalid = false;
+    let badFrame = false;
+    let eventType = "";
     for (const line of text.split("\n")) {
+        if (line.trim() === "") {
+            eventType = "";
+            continue;
+        }
+        if (line.startsWith("event:")) {
+            eventType = line.slice(6).trim();
+            continue;
+        }
         if (!line.startsWith("data:")) continue;
         const payload = line.slice(5).trim();
         if (!payload || payload === "[DONE]") continue;
@@ -318,12 +357,21 @@ function extractSummaryFromSse(protocol: PreflightProtocol, text: string): strin
         try {
             obj = JSON.parse(payload);
         } catch {
+            badFrame = true;
             continue;
         }
-        if (!obj || typeof obj !== "object") continue;
+        if (!obj || typeof obj !== "object") {
+            badFrame = true;
+            continue;
+        }
         const o = obj as Record<string, unknown>;
+        const type = typeof o.type === "string" ? o.type : eventType;
+        if (type === "error" || type === "response.incomplete" || type === "response.failed" || type === "response.error" || (!type && o.error && typeof o.error === "object")) {
+            invalid = true;
+            continue;
+        }
         if (protocol === "anthropic") {
-            if (o.type === "content_block_delta") {
+            if (type === "content_block_delta") {
                 const d = o.delta as Record<string, unknown> | undefined;
                 if (d && d.type === "text_delta" && typeof d.text === "string") out += d.text;
             }
@@ -334,15 +382,23 @@ function extractSummaryFromSse(protocol: PreflightProtocol, text: string): strin
                 if (delta && typeof delta.content === "string") out += delta.content;
             }
         } else {
-            if (o.type === "response.output_text.delta" && typeof o.delta === "string") {
+            if (type === "response.output_text.delta" && typeof o.delta === "string") {
                 out += o.delta;
-            } else if (o.type === "response.completed" && o.response && typeof o.response === "object") {
-                const full = extractSummaryText(protocol, o.response as Record<string, unknown>);
-                if (full) return full;
+            } else if (type === "response.output_text.done" && typeof o.text === "string") {
+                terminalText += o.text;
+            } else if (type === "response.output_item.done" && o.item && typeof o.item === "object") {
+                terminalText += extractSummaryText("responses", { output: [o.item] });
+            } else if (type === "response.completed" && o.response && typeof o.response === "object") {
+                completed = true;
+                const full = extractSummaryText("responses", o.response as Record<string, unknown>);
+                if (full) terminalText = full;
             }
         }
     }
-    return out;
+    if (invalid) return "";
+    if (protocol === "responses") return completed ? terminalText || out : "";
+    if (badFrame || !framed) return "";
+    return out || terminalText;
 }
 
 function extractSummaryText(protocol: PreflightProtocol, json: Record<string, unknown>): string {
@@ -424,6 +480,7 @@ export function diagnoseEmptySummary(text: string, json?: unknown): string {
         if (err) return err;
     }
     let sseEvents = 0;
+    let halfLines = 0;
     let firstPayload = "";
     for (const line of text.split("\n")) {
         if (!line.startsWith("data:")) continue;
@@ -434,14 +491,25 @@ export function diagnoseEmptySummary(text: string, json?: unknown): string {
         try {
             obj = JSON.parse(payload);
         } catch {
+            halfLines += 1;
             continue;
         }
-        if (!obj || typeof obj !== "object") continue;
+        if (!obj || typeof obj !== "object") {
+            halfLines += 1;
+            continue;
+        }
         sseEvents += 1;
         const err = extractStreamError(obj as Record<string, unknown>);
         if (err) return err;
     }
-    if (sseEvents > 0) return `the upstream stream carried ${sseEvents} SSE event(s) but no summary text (first event: ${firstPayload})`;
+    // #780: the extractor rejects mid-frame-truncated streams (#764 shape) — say so
+    // explicitly instead of the generic no-text message, which reads like an
+    // upstream that simply never answered with a summary.
+    if (halfLines > 0 && sseEvents === 0) return `the upstream stream had ${halfLines} incomplete data line(s) and no parseable events (stream appears truncated)`;
+    if (sseEvents > 0) {
+        const truncated = halfLines > 0 || !/\r?\n\r?\n$/.test(text) ? ` (stream appears truncated: ${halfLines > 0 ? `${halfLines} incomplete data line(s)` : "no final frame terminator"})` : "";
+        return `the upstream stream carried ${sseEvents} SSE event(s) but no summary text${truncated} (first event: ${firstPayload})`;
+    }
     const trimmed = text.trim();
     if (!trimmed) return "the upstream returned an empty body";
     return `the upstream returned a non-SSE body with no summary text (first 200 bytes: ${trimmed.slice(0, 200)})`;
@@ -554,6 +622,7 @@ function noEmergencyTruncate(config: Config): Config {
 
 export async function preflightCompress(deps: PreflightDeps, messages: CoreMessage[]): Promise<PreflightResult> {
     const limit = deps.config.modelContextLimit;
+    let target = Math.min(limit, deps.compressionTarget ?? limit);
     const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: estimateCoreMessages(messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0), fitsWindow: true };
     if (limit <= 0) return result;
     const budget = Math.max(MIN_CHUNK_TOKENS, Math.floor(limit * CHUNK_FRACTION));
@@ -625,7 +694,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // (the floor can be stale — see PreflightResult.payloadEstimate).
         result.payloadEstimate = estimateCoreMessages(turn.messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0);
         if (startTokens < 0) startTokens = currentTokens;
-        if (currentTokens < limit) break;
+        if (currentTokens < target) break;
         const ranges = viableRanges(turn.nudge?.compressibleRanges ?? []);
         if (ranges.length === 0) {
             // #330: nothing foldable outside the soft-protected recent zone.
@@ -637,6 +706,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             if (!relaxed && result.payloadEstimate >= limit) {
                 activeConfig = relaxedConfig(deps.config);
                 relaxed = true;
+                target = limit;
                 // #575-merge: the summarization budget counts per protection
                 // regime — reset it on relax, else bad summaries burned under
                 // normal protection can starve the relaxed walk entirely and
@@ -652,7 +722,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         const ordered = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef));
         let appliedThisRound = 0;
         for (const range of ordered) {
-            if (currentTokens < limit) break;
+            if (currentTokens < target) break;
             if (deps.signal?.aborted) {
                 failure = ABORTED_FAILURE;
                 break;
@@ -679,7 +749,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // exactly those cases. Bounded by the per-regime call budget below.
             const spans: Array<[number, number]> = splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText).slice().reverse();
             while (spans.length > 0) {
-                if (currentTokens < limit) break;
+                if (currentTokens < target) break;
                 if (deps.signal?.aborted) {
                     failure = ABORTED_FAILURE;
                     break;

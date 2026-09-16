@@ -97,9 +97,11 @@ export function replaceBiliCompactionItems<T>(input: T[]): { items: T[]; replace
 // the pipeline can dispatch a compaction request (forge vs verbatim
 // passthrough) before prepare/preflight touch payload or state. 90% is codex's
 // own auto-compact point — above it, native compaction must backstop.
+export const CODEX_COMPACT_HEALTH_RATIO = 0.9;
+
 export function codexCompactGatePre(session: Session, effectiveLimit: number): boolean {
     if (effectiveLimit <= 0) return false;
-    if (session.stats.lastInputTokens >= effectiveLimit * 0.9) return false;
+    if (session.stats.lastInputTokens >= effectiveLimit * CODEX_COMPACT_HEALTH_RATIO) return false;
     return session.state.blocks.some((b) => b.active);
 }
 

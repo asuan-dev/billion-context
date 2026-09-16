@@ -27,7 +27,7 @@ import * as tar from "tar";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { cacheDir } from "./paths.js";
-import { log as loggerLog } from "./logger.js";
+import { log as loggerLog, type Logger } from "./logger.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import type { FetchOptions } from "./fetch-util.js";
 
@@ -62,6 +62,12 @@ export function shouldStealLock(holderAlive: boolean, ageMs: number): boolean {
 let timer: ReturnType<typeof setInterval> | undefined;
 let inFlight = false;
 let firstCheckDone = false;
+// #806: dedupe key for the stale-install reminder (version pair).
+let staleWarnKey: string | undefined;
+
+export function _resetStaleWarnForTest(): void {
+    staleWarnKey = undefined;
+}
 
 // --- Version comparison (ported from opencode-acp lib/update.ts) ---
 // Proper semver including prerelease ordering: a prerelease is OLDER than its
@@ -116,6 +122,31 @@ function parseSemVer(version: string): { parts: number[]; pre: string[] } | unde
  *  every "up to date" line since has been misleading (#327). */
 export function staleInstallStatus(diskVersion: string | undefined, runningVersion: string): "restart" | "current" {
     return diskVersion !== undefined && isVersionNewer(diskVersion, runningVersion) ? "restart" : "current";
+}
+
+/** Up-to-date branch of an update check — returns true when the caller must
+ *  stop (nothing to install). #806: the restart reminder dedupes per version
+ *  pair so it no longer re-logs on every 180s check once the pair is known. */
+export function reportNotNewer(
+    latest: string,
+    tag: string,
+    diskVersion: string | undefined,
+    runningVersion: string,
+    log: Logger,
+): boolean {
+    const currentVersion = diskVersion ?? runningVersion;
+    if (isVersionNewer(latest, currentVersion)) return false;
+    if (staleInstallStatus(diskVersion, runningVersion) === "restart") {
+        const key = `${runningVersion}->${diskVersion}`;
+        if (key !== staleWarnKey) {
+            staleWarnKey = key;
+            log("warn", `[update] running v${runningVersion} but v${diskVersion} is installed — restart bili to activate (auto-update replaced the on-disk install; this process is still on the old code)`);
+        }
+    } else {
+        staleWarnKey = undefined;
+        log("info", `[update] current=${currentVersion} latest=${latest} tag=${tag} (up to date)`);
+    }
+    return true;
 }
 
 async function readLastCheck(): Promise<number> {
@@ -458,14 +489,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         const diskVersion = installDir ? await readDiskVersion(installDir) : undefined;
         const currentVersion = diskVersion ?? opts.currentVersion;
 
-        if (!isVersionNewer(latest, currentVersion)) {
-            if (staleInstallStatus(diskVersion, opts.currentVersion) === "restart") {
-                loggerLog("warn", `[update] running v${opts.currentVersion} but v${diskVersion} is installed — restart bili to activate (auto-update replaced the on-disk install; this process is still on the old code)`);
-            } else {
-                loggerLog("info", `[update] current=${currentVersion} latest=${latest} tag=${tag} (up to date)`);
-            }
-            return;
-        }
+        if (reportNotNewer(latest, tag, diskVersion, opts.currentVersion, loggerLog)) return;
 
         const tarballUrl = data.dist?.tarball;
         const integrity = data.dist?.integrity;

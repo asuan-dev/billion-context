@@ -83,6 +83,12 @@ test("lookupContextLimit returns known windows", () => {
     assert.equal(lookupContextLimit("kimi-k2"), 128_000);
 });
 
+test("lookupContextLimit matches relay/vLLM 'prefix/name' ids via the bare basename (#736)", () => {
+    assert.equal(lookupContextLimit("meta-llama/Llama-4-Maverick"), 128_000);
+    assert.equal(lookupContextLimit("qwen/qwen3.8-27b"), 128_000);
+    assert.equal(lookupContextLimit("unknown-org/unknown-model"), undefined);
+});
+
 test("lookupContextLimit returns undefined for unknown models", () => {
     assert.equal(lookupContextLimit("some-future-model"), undefined);
     assert.equal(lookupContextLimit(""), undefined);

@@ -47,3 +47,24 @@ test("usageTotals: empty usage → undefined total", () => {
     assert.equal(usageTotals("openai", {}).total, undefined);
     assert.equal(usageTotals("anthropic", {}).total, undefined);
 });
+
+// #779: DeepSeek reports KV-cache hits as top-level prompt_cache_hit_tokens
+// instead of prompt_tokens_details.cached_tokens — normalize both.
+test("usageTotals: OpenAI — top-level prompt_cache_hit_tokens normalized (#779)", () => {
+    const { total, cached } = usageTotals("openai", {
+        prompt_tokens: 1000,
+        prompt_cache_hit_tokens: 850,
+    });
+    assert.equal(cached, 850);
+    assert.equal(total, 1000); // prompt already includes hit+miss — no double count
+});
+
+test("usageTotals: OpenAI — standard field wins when both are present (#779)", () => {
+    const { total, cached } = usageTotals("openai", {
+        prompt_tokens: 1000,
+        prompt_tokens_details: { cached_tokens: 900 },
+        prompt_cache_hit_tokens: 850,
+    });
+    assert.equal(cached, 900);
+    assert.equal(total, 1000);
+});

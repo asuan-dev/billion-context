@@ -86,6 +86,39 @@ test("openai adapter: separated usage chunk (choices:[] + usage) captured → la
     assert.ok((ctx.session.stats.lastInputTokens ?? 0) > 0, "usage from choices:[] chunk captured (lastInputTokens > 0)");
 });
 
+test("openai adapter: DeepSeek prompt_cache_hit_tokens normalized into stats + completion usage (#779)", async () => {
+    const round1 = [
+        `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "gpt", choices: [{ index: 0, delta: { content: "Hi" }, finish_reason: null }] })}\n\n`,
+        `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "gpt", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`,
+        `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "gpt", choices: [], usage: { prompt_tokens: 42, completion_tokens: 7, prompt_cache_hit_tokens: 30 } })}\n\n`,
+        `data: [DONE]\n\n`,
+    ].join("");
+    const ctx = makeCtx("openai-deepseek-cache");
+    const out = await drain(
+        new Response(round1, { status: 200 }).body!,
+        ctx,
+        createOpenaiAdapter({ model: "gpt" }),
+        { model: "gpt", messages: [], stream: true },
+    );
+    assert.equal(ctx.session.stats.cachedTokens, 30, "top-level prompt_cache_hit_tokens counted");
+    assert.equal(ctx.session.stats.cacheSamples, 1, "cache sample recorded");
+    assert.ok(out.includes('"prompt_tokens_details":{"cached_tokens":30}'), `synthesized completion carries normalized cached_tokens: ${out}`);
+});
+
+test("openai adapter: finish-frame usage — standard field wins over prompt_cache_hit_tokens (#779)", async () => {
+    const adapter = createOpenaiAdapter({ model: "gpt" });
+    const stream = new Response([
+        `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "gpt", choices: [{ index: 0, delta: { content: "Hi" }, finish_reason: null }] })}\n\n`,
+        `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "gpt", choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 42, completion_tokens: 7, prompt_tokens_details: { cached_tokens: 25 }, prompt_cache_hit_tokens: 30 } })}\n\n`,
+        `data: [DONE]\n\n`,
+    ].join("")).body!;
+    let cached: number | undefined;
+    for await (const ev of adapter.parseStream(stream, 1)) {
+        if (ev.kind === "usage") cached = ev.cachedTokens;
+    }
+    assert.equal(cached, 25, "standard field wins when both present");
+});
+
 test("openai adapter: acp_status-only round → marker + re-request, no crash", async () => {
     const round1 = [
         `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "gpt", choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] })}\n\n`,

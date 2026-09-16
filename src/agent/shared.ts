@@ -84,13 +84,34 @@ async function fetchJson(url: string, init: RequestInit | undefined, timeoutMs: 
     }
 }
 
-export async function fetchManifest(proxyBase: string): Promise<ManifestTool[]> {
+export async function fetchManifest(proxyBase: string, format: "anthropic" | "openai" = "anthropic"): Promise<ManifestTool[]> {
     const { ok, status, json } = await fetchJson(`${proxyBase}/__bili/plugin/manifest`, undefined, MANIFEST_TIMEOUT_MS);
     if (!ok || !json || typeof json !== "object") throw new Error(`manifest fetch failed: ${status}`);
+    if (format === "openai") {
+        // OpenAI function style: {name, description, parameters} (plain JSON Schema).
+        const data = json as { tools?: { openai?: { name?: string; description?: string; parameters?: unknown }[] } };
+        const tools = (data.tools?.openai ?? []).filter((t): t is { name: string; description?: string; parameters?: unknown } => typeof t.name === "string");
+        if (tools.length === 0) throw new Error("manifest served no openai tools");
+        return tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.parameters ?? { type: "object", properties: {} } }));
+    }
     const data = json as { tools?: { anthropic?: { name?: string; description?: string; input_schema?: unknown }[] } };
     const tools = (data.tools?.anthropic ?? []).filter((t): t is { name: string; description?: string; input_schema?: unknown } => typeof t.name === "string");
     if (tools.length === 0) throw new Error("manifest served no anthropic tools");
     return tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.input_schema ?? { type: "object", properties: {} } }));
+}
+
+const COMPACT_TIMEOUT_MS = 5000;
+
+/** Report a host-native compaction boundary to the proxy archive (#395):
+ *  hosts that compact natively (opencode) cannot cancel it, so the proxy
+ *  marks the boundary and archives unreachable blocks. Fire-and-forget at
+ *  call sites — a missed report degrades to stale blocks, not broken turns. */
+export async function reportCompactionBoundary(proxyBase: string, conversationId: string): Promise<void> {
+    await fetchJson(`${proxyBase}/__bili/plugin/compact`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ conversationId }),
+    }, COMPACT_TIMEOUT_MS);
 }
 
 export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal): Promise<string> {

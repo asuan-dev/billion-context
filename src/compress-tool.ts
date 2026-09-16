@@ -108,3 +108,13 @@ const MARKER_INTEGRITY_NOTE =
 export function withMarkerIntegrityNote(text: string): string {
     return text + MARKER_INTEGRITY_NOTE;
 }
+
+// #760: per-call conversation_id for MCP tools. Hosts that share ONE MCP shim
+// process across several concurrent conversations (kimi web et al.) have no
+// env/meta session channel, so the proxy prints its own resolved session id
+// and the model echoes it back as the conversation_id argument of every
+// mcp__bili__ call. Session-stable, so it rides the static system-prompt part
+// (prefix-cache safe) next to MARKER_INTEGRITY_NOTE, in BOTH modes.
+export function withConversationIdNote(text: string, conversationId: string): string {
+    return text + `\n\n[Your bili conversation id: ${conversationId}. When calling the bili compression tools, pass this value as the conversation_id argument so a shared MCP process can route the call to THIS session.]`;
+}

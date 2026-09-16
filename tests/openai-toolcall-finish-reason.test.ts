@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createOpenaiAdapter } from "../src/loop/index.ts";
+import { createCore, createInitialState, defaultConfig } from "acp-kernel";
+import type { Config, CoreMessage } from "acp-kernel";
+import type { Session } from "../src/session.ts";
+import { createOpenaiAdapter, runCompressLoop } from "../src/loop/index.ts";
+import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import type { ParsedStreamEvent } from "../src/loop/core.ts";
 
 const enc = new TextEncoder();
@@ -31,7 +35,85 @@ const collect = async (stream: ReadableStream<Uint8Array>) => {
     return events;
 };
 
-// 1. Non-compliant upstream: tool_calls + finish_reason="stop" → passthrough
+function makeLoopCtx(): {
+    core: ReturnType<typeof createCore>;
+    config: Config;
+    messages: CoreMessage[];
+    session: Session;
+    log: (message: string) => void;
+} {
+    return {
+        core: createCore(),
+        config: defaultConfig(200000),
+        messages: [],
+        session: {
+            id: "openai-in-band-error-loop",
+            meta: {},
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+            metadata: {},
+            state: createInitialState(),
+            createdAt: Date.now(),
+            lastSeen: Date.now(),
+            blockContents: new Map(),
+            inFlight: 0,
+            persisted: false,
+        },
+        log: () => {},
+        protocol: "openai",
+    };
+}
+
+// 1. An in-band error frame must not be ignored as a choices-less usage frame.
+test("openai adapter: in-band error is surfaced and does not become empty stop", async () => {
+    const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+            controller.enqueue(enc.encode(`data: ${JSON.stringify({ error: { code: "server_is_overloaded", message: "busy" } })}\n\n`));
+            controller.enqueue(enc.encode("data: [DONE]\n\n"));
+            controller.close();
+        },
+    });
+    const events = await collect(stream);
+    assert.deepEqual(events, [{ kind: "error", message: "server_is_overloaded: busy" }]);
+});
+
+// The adapter-level test above proves parsing; this loop-level test proves the
+// error cannot become a synthetic successful completion at the client boundary.
+test("openai loop: in-band error emits protocol error without completion", async () => {
+    const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+            controller.enqueue(enc.encode(`data: ${JSON.stringify({ error: { code: "server_is_overloaded", message: "busy" } })}\n\n`));
+            controller.enqueue(enc.encode("data: [DONE]\n\n"));
+            controller.close();
+        },
+    });
+    const originalFetch = globalThis.fetch;
+    let retryFetches = 0;
+    globalThis.fetch = (async () => {
+        retryFetches++;
+        return new Response(`data: ${JSON.stringify({ error: { code: "server_is_overloaded", message: "busy" } })}\n\ndata: [DONE]\n\n`, { status: 200 });
+    }) as typeof fetch;
+    try {
+        const chunks: Buffer[] = [];
+        for await (const chunk of runCompressLoop(
+            stream,
+            makeLoopCtx(),
+            { model: "gpt", stream: true },
+            { url: "http://mock", headers: {} },
+            createOpenaiAdapter({ model: "gpt" }),
+            buildCompressSystemPrompt(),
+        )) chunks.push(chunk);
+        const output = Buffer.concat(chunks).toString("utf8");
+        assert.equal(retryFetches, 1, "zero-byte in-band errors get the existing single invisible retry");
+        assert.match(output, /server_is_overloaded: busy/);
+        assert.match(output, /\[acp-proxy: upstream stream truncated/);
+        assert.match(output, /\[DONE\]/);
+        assert.doesNotMatch(output, /no completion event/);
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+// 2. Non-compliant upstream: tool_calls + finish_reason="stop" → passthrough
 //    (real tool_call chunks are forwarded verbatim as meta; finish_reason kept as-is).
 test("openai adapter: real tool_calls passed through verbatim (meta)", async () => {
     const stream = mockStream(
@@ -56,7 +138,7 @@ test("openai adapter: real tool_calls passed through verbatim (meta)", async () 
     assert.equal(done!.suppressCompletion, true, "no regenerated completion after the verbatim replay");
 });
 
-// 2. Compliant upstream: tool_calls + finish_reason="tool_calls" → unchanged.
+// 3. Compliant upstream: tool_calls + finish_reason="tool_calls" → unchanged.
 test("openai adapter: compliant finish_reason=tool_calls left unchanged", async () => {
     const stream = mockStream(
         sseChunk({ role: "assistant" }),
@@ -72,7 +154,7 @@ test("openai adapter: compliant finish_reason=tool_calls left unchanged", async 
     assert.equal(done?.kind === "done" && done.finishReason, "tool_calls");
 });
 
-// 3. No tool_calls + finish_reason="stop" → unchanged (normal text completion).
+// 4. No tool_calls + finish_reason="stop" → unchanged (normal text completion).
 test("openai adapter: text-only finish_reason=stop left unchanged", async () => {
     const stream = mockStream(sseChunk({ role: "assistant" }), sseChunk({ content: "hello" }), sseChunk({}, "stop"));
     const events = await collect(stream);
@@ -80,7 +162,7 @@ test("openai adapter: text-only finish_reason=stop left unchanged", async () => 
     assert.equal(done?.kind === "done" && done.finishReason, "stop");
 });
 
-// 4. REGRESSION (SGLang/vLLM name-splitting): the tool NAME arrives in the
+// 5. REGRESSION (SGLang/vLLM name-splitting): the tool NAME arrives in the
 //    first delta and continuation deltas carry EMPTY names. A proxy tool
 //    (compress) split this way must be accumulated and handed to the compress
 //    loop as a structured event — the client must never see an empty-name
@@ -120,7 +202,7 @@ test("openai adapter: name-split proxy tool never leaks to the client", async ()
     assert.notEqual(done?.kind === "done" && done.suppressCompletion, true, "proxy round: completion NOT suppressed (loop re-requests)");
 });
 
-// 5. Name-split REAL tool: fragments must accumulate and replay with the
+// 6. Name-split REAL tool: fragments must accumulate and replay with the
 //    original chunk order/ids, exactly like the single-fragment case.
 test("openai adapter: name-split real tool accumulates and replays verbatim", async () => {
     const stream = mockStream(
@@ -141,7 +223,7 @@ test("openai adapter: name-split real tool accumulates and replays verbatim", as
     assert.equal(done?.kind === "done" && done.finishReason, "tool_calls");
 });
 
-// 6. Mixed round (compress + real bash in the same turn): the replay must
+// 7. Mixed round (compress + real bash in the same turn): the replay must
 //    contain ONLY the real call's fragments; the compress call goes to the
 //    loop as a structured event for server-side execution.
 test("openai adapter: mixed proxy+real round strips proxy fragments from the replay", async () => {

@@ -289,7 +289,23 @@ export function modelVariants(name: string): string[] {
 function registryLookup(reg: RegistryShape | null, model: string, host?: string): number | undefined {
     if (!reg || !model) return undefined;
     const provider = host ? providerFromHost(host) : undefined;
-    for (const name of modelVariants(model)) {
+    // Relay/vLLM deployments serve models under arbitrary "prefix/name" ids
+    // ("qwen/qwen3.8-27b") that match no models.dev provider key (the registry
+    // stores "alibaba/qwen3.8-27b"): the exact key misses and the suffix scan
+    // looks for keys ending in "/qwen/qwen3.8-27b", which also never exist —
+    // the registry data was present and fresh yet unreachable, so the stale
+    // built-in table won forever (#736). Try the bare basename after the full
+    // name so a genuinely listed prefixed id still keeps precedence.
+    const roots = [model];
+    const slash = model.lastIndexOf("/");
+    if (slash > 0 && slash < model.length - 1) roots.push(model.slice(slash + 1));
+    const names: string[] = [];
+    for (const root of roots) {
+        for (const variant of modelVariants(root)) {
+            if (!names.includes(variant)) names.push(variant);
+        }
+    }
+    for (const name of names) {
         const candidates = provider ? [`${provider}/${name}`, name] : [name];
         for (const key of candidates) {
             const entry = reg[key];

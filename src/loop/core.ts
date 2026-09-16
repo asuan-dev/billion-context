@@ -99,8 +99,9 @@ export type ParsedStreamEvent =
     | { kind: "text"; delta: string; raw?: Buffer }
     | { kind: "reasoning"; delta: string; raw?: Buffer; signature?: string; blockEnd?: boolean }
     | { kind: "tool_call"; name: string; callId: string; arguments: string; passthrough?: boolean }
-    | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number }
+    | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number }
     | { kind: "done"; finishReason?: string; suppressCompletion?: boolean; truncated?: boolean; thinking?: boolean }
+    | { kind: "error"; message: string }
     | { kind: "meta"; chunk: Buffer; firstRoundOnly?: boolean };
 
 export interface EmitCompletionOpts {
@@ -163,19 +164,23 @@ export function executeProxyTool(
 
 function recordUsage(
     ctx: LoopCtx,
-    usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number },
+    usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number },
     round: number,
 ): void {
     const prompt = usage.inputTokens;
     const cached = usage.cachedTokens;
     const out = usage.outputTokens;
-    const total = promptInputTotal(ctx.protocol, prompt, cached);
+    const total = promptInputTotal(ctx.protocol, prompt, cached, usage.creationTokens);
     if (total > 0) ctx.session.stats.inputTokens += total;
     // Net out this turn's compress credit: the post-compress re-request
     // re-sends the unfolded history, so its usage report over-reports the
     // context the NEXT request will actually carry (see stream.ts applyRanges).
-    ctx.session.stats.lastInputTokens = Math.max(0, total - (ctx.session.stats.compressCreditTokens ?? 0));
-    if (typeof cached === "number") {
+    // #793: a zero-total sample (missing or placeholder input) must not
+    // clobber the last trusted value — mirrors applyUsageSample (plugin mode).
+    if (total > 0) {
+        ctx.session.stats.lastInputTokens = Math.max(0, total - (ctx.session.stats.compressCreditTokens ?? 0));
+    }
+    if (typeof cached === "number" && total > 0) {
         ctx.session.stats.cachedTokens += cached;
         ctx.session.stats.cacheSamples += 1;
     }
@@ -186,7 +191,7 @@ function recordUsage(
     const foldNew = ctx.session.stats.pendingFoldUsage === true;
     if (foldNew) ctx.session.stats.pendingFoldUsage = false;
     ctx.log(
-        `[acp-usage] round ${round} input=${total} cached=${cached ?? 0} (cache hit ${hitPct}%)${foldNew ? " fold=new" : ""}`,
+        `[acp-usage] round ${round} input=${total} cached=${cached ?? 0} (cache hit ${hitPct}%)${foldNew ? " fold=new" : ""}${total <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`,
     );
 }
 
@@ -249,15 +254,22 @@ export async function* runCompressLoop(
             const reasoningSegments: { text: string; signature: string }[] = [];
             let reasoningSealed = true;
             const calls: ToolCallEmit[] = [];
-            let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number } = {};
+            let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number } = {};
             let finishReason: string | undefined;
+            let streamError: string | undefined;
             let sawDone = false;
             let suppressCompletion = false;
             let truncatedDone = false;
             let sawThinking = false;
             let forwardedAny = false;
-            const fwd = (chunk: Buffer): Buffer => {
+            // #821: on wires that stream reasoning verbatim (openai/anthropic) a thinking-only
+            // turn sets forwardedAny before done, making the #732 retry unreachable there. Track
+            // model-VISIBLE output separately: a reasoning prefix is invisible to host turn
+            // semantics, so the degenerate retry may still append a fresh attempt to the stream.
+            let forwardedVisible = false;
+            const fwd = (chunk: Buffer, visible = false): Buffer => {
                 forwardedAny = true;
+                if (visible) forwardedVisible = true;
                 return chunk;
             };
 
@@ -269,20 +281,22 @@ export async function* runCompressLoop(
                 calls.length = 0;
                 usage = {};
                 finishReason = undefined;
+                streamError = undefined;
                 sawDone = false;
                 suppressCompletion = false;
                 truncatedDone = false;
                 sawThinking = false;
                 forwardedAny = false;
+                forwardedVisible = false;
 
                 for await (const ev of adapter.parseStream(currentUpstream, round)) {
                     if (signal?.aborted) break;
                     if (ev.kind === "text") {
                         assistantText += ev.delta;
                         if (!ctx.textProtocol && ev.raw) {
-                            yield fwd(ev.raw);
+                            yield fwd(ev.raw, true);
                         } else if (!ctx.textProtocol && round > 1 && ev.delta.length > 0) {
-                            yield fwd(adapter.emitText(ev.delta));
+                            yield fwd(adapter.emitText(ev.delta), true);
                         }
                     } else if (ev.kind === "reasoning") {
                         assistantReasoning += ev.delta;
@@ -309,6 +323,7 @@ export async function* runCompressLoop(
                             inputTokens: ev.inputTokens,
                             outputTokens: ev.outputTokens,
                             cachedTokens: ev.cachedTokens,
+                            creationTokens: ev.creationTokens,
                         };
                     } else if (ev.kind === "done") {
                         sawDone = true;
@@ -316,11 +331,24 @@ export async function* runCompressLoop(
                         suppressCompletion = ev.suppressCompletion === true;
                         truncatedDone = ev.truncated === true;
                         sawThinking = ev.thinking === true;
+                    } else if (ev.kind === "error") {
+                        // A 200 SSE response can still carry a provider error.
+                        // Preserve it as an error path; never let the absence of
+                        // choices fall through to a synthetic successful stop.
+                        streamError = ev.message;
                     } else if (ev.kind === "meta") {
                         if (round === 1 || !ev.firstRoundOnly) {
                             yield fwd(ev.chunk);
                         }
                     }
+                }
+
+                // An in-band error has no completion event. Keep it on the
+                // same zero-side-effect retry path as an abruptly truncated
+                // stream; importantly, do not synthesize a successful stop.
+                if (streamError !== undefined) {
+                    ctx.log(`[acp-loop] round ${round}: upstream stream error: ${streamError}`);
+                    loggerLog("warn", `[acp-loop] upstream stream error: ${streamError}`);
                 }
 
                 // #413: zero-side-effect truncation — the client received
@@ -361,7 +389,7 @@ export async function* runCompressLoop(
                     }
                 }
 
-                // #732 (completes the auto-retry groundwork of #673/#674): a reasoning model can end a turn with ONLY a thinking block — zero visible text, zero tool calls, status completed — most often right after a post-compress re-request, where it sees the freshly-shrunk context and "wraps up" into a silent thought. The client then receives an empty completed turn and stalls until manually nudged. When NOTHING reached the client yet (forwardedAny=false — true for these rounds on wires whose round>1 framing is suppressed, e.g. Responses), the retry is invisible to the client: re-fetch once with a continuation nudge (a plain re-fetch reproduces the same silent output deterministically). One-shot per request. `sawThinking` is mandatory so a genuinely empty (no-reasoning) terminal turn is left untouched — only the "silent thought" shape retries.
+                // #732 (completes the auto-retry groundwork of #673/#674), extended by #821: a reasoning model can end a turn with ONLY a thinking block — zero visible text, zero tool calls, status completed — most often right after a post-compress re-request, where it sees the freshly-shrunk context and "wraps up" into a silent thought. The client then receives an empty completed turn and stalls until manually nudged. Retriable when no VISIBLE output reached the client yet (!forwardedVisible): on Responses rounds the framing is suppressed so nothing was forwarded at all; on openai/anthropic a thinking-only prefix WAS streamed verbatim, but it is invisible to host turn semantics and its chunks carry no finish_reason, so appending the retry's content to the same stream is safe. Re-fetch once with a continuation nudge (a plain re-fetch reproduces the same silent output deterministically). One-shot per request. `sawThinking` is mandatory so a genuinely empty (no-reasoning) terminal turn is left untouched — only the "silent thought" shape retries.
                 if (
                     !degenerateRetried &&
                     sawDone &&
@@ -374,11 +402,11 @@ export async function* runCompressLoop(
                     finishReason !== "error" &&
                     assistantText.length === 0 &&
                     calls.length === 0 &&
-                    !forwardedAny &&
+                    !forwardedVisible &&
                     !signal?.aborted
                 ) {
                     degenerateRetried = true;
-                    ctx.log(`[acp-loop] round ${round}: degenerate terminal turn (completed, zero text/tool calls) invisible to client; retrying once with continuation nudge (#732)`);
+                    ctx.log(`[acp-loop] round ${round}: degenerate terminal turn (completed, zero visible output); retrying once with continuation nudge (#732/#821)`);
                     loggerLog("warn", `[acp-loop] degenerate-turn auto-retry round ${round} (session ${ctx.session.id})`);
                     const nudge: CoreMessage = {
                         id: `acp_degenerate_retry_r${round}`,
@@ -592,7 +620,7 @@ export async function* runCompressLoop(
                 // overflow signal (sglang-style backends accept an oversized
                 // prompt then die mid-stream). Both shapes: !sawDone (chat /
                 // anthropic) and truncatedDone (responses synthetic failed done).
-                if (!sawDone || truncatedDone) {
+                if ((!sawDone || truncatedDone) && streamError === undefined) {
                     const reqModel = typeof requestBody["model"] === "string" ? requestBody["model"] : undefined;
                     noteWeakOverflow(ctx.session, {
                         inputTokens: usage.inputTokens,
@@ -603,7 +631,8 @@ export async function* runCompressLoop(
                 if (!sawDone) {
                     const partialText = assistantText.length;
                     const partialReasoning = assistantReasoning.length;
-                    const msg = `upstream stream truncated (no completion event; round ${round}, ${partialText} text chars + ${partialReasoning} reasoning chars received)`;
+                    const detail = streamError !== undefined ? `upstream stream error: ${streamError}` : "no completion event";
+                    const msg = `upstream stream truncated (${detail}; round ${round}, ${partialText} text chars + ${partialReasoning} reasoning chars received)`;
                     ctx.log(`[acp-loop] round ${round}: ${msg}`);
                     yield adapter.emitError(msg);
                     return;

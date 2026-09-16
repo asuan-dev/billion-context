@@ -51,6 +51,16 @@ function okSummarySse(res: http.ServerResponse): void {
     res.end();
 }
 
+// #780: two complete delta frames, then a half-line cut mid-JSON — no
+// completed terminal, no final frame terminator (#764 gateway-corruption shape).
+// The extractor must reject this as unusable rather than persist the partial text.
+function truncatedSummarySse(res: http.ServerResponse): void {
+    res.write(sse("response.output_text.delta", { type: "response.output_text.delta", delta: SUMMARY_TEXT.slice(0, 40) }));
+    res.write(sse("response.output_text.delta", { type: "response.output_text.delta", delta: SUMMARY_TEXT.slice(40, 80) }));
+    res.write(`data: ${JSON.stringify({ type: "response.output_text.delta", delta: "tail" }).slice(0, 30)}\n`);
+    res.end();
+}
+
 function forwardSse(res: http.ServerResponse, inputTokens = 800): void {
     res.write(sse("response.completed", {
         type: "response.completed",
@@ -84,7 +94,7 @@ function inputContentChars(parsed: ParsedBody): number {
     return typeof c === "string" ? c.length : 0;
 }
 
-function makeUpstream(calls: Call[], failAboveChars: number, forwardInputTokens = 800): http.Server {
+function makeUpstream(calls: Call[], failAboveChars: number, forwardInputTokens = 800, truncateSummaries = false): http.Server {
     return http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
@@ -96,6 +106,11 @@ function makeUpstream(calls: Call[], failAboveChars: number, forwardInputTokens 
             if (isSummaryCall(parsed) && parsed.stream !== true) {
                 res.writeHead(400, { "content-type": "application/json" });
                 res.end(JSON.stringify({ detail: "Stream must be set to true" }));
+                return;
+            }
+            if (truncateSummaries && isSummaryCall(parsed)) {
+                res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+                truncatedSummarySse(res);
                 return;
             }
             if (failed) {
@@ -311,4 +326,44 @@ test("#726 diagnoseEmptySummary: extracts terminal error signals from 200 bodies
         diagnoseEmptySummary('{"unrelated":"body"}'),
         /non-SSE body with no summary text/,
     );
+});
+
+test("#780 truncated summary stream is unusable: diagnosis names truncation, bounded calls, cooldown arms, nothing forwarded", async () => {
+    const calls: Call[] = [];
+    const upstream = makeUpstream(calls, 0, 800, true);
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+
+    const proxy = await startProxy(upstreamPort, { "gpt-7-sol": { context: 10_000 } });
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+
+    try {
+        const r = await driveResponses(proxyPort, upstreamPort, "s780-trunc", "gpt-7-sol", longResponsesInput(12));
+        assert.equal(r.status, 502, `truncated summaries must fail-fast, got ${r.status}`);
+        const j = (await r.json()) as { error?: { code?: string; message?: string } };
+        assert.equal(j.error?.code, "preflight_compress_failed");
+        assert.ok(
+            j.error?.message?.includes("stream appears truncated"),
+            `fail-fast message must carry the truncation diagnosis, got: ${j.error?.message}`,
+        );
+        const summaries = calls.filter((c) => c.summary);
+        assert.ok(summaries.length >= 2 && summaries.length <= 9, `summary calls must be bounded, got ${summaries.length}: ${JSON.stringify(summaries)}`);
+        assert.ok(!calls.some((c) => !c.summary), "nothing may be forwarded on failure");
+
+        const sess = listSessions().find((s) => s.id.includes("s780-trunc"));
+        assert.ok(sess?.metadata?.preflightDeadEnd, "zero-progress failure must arm the dead-end marker");
+
+        const callsBeforeRetry = calls.length;
+        const r2 = await driveResponses(proxyPort, upstreamPort, "s780-trunc", "gpt-7-sol", longResponsesInput(12));
+        assert.equal(r2.status, 502, `cooldown must fail fast, got ${r2.status}`);
+        assert.equal(calls.length, callsBeforeRetry, "cooldown must spend ZERO upstream calls");
+    } finally {
+        proxy.close();
+        upstream.close();
+        await new Promise<void>((resolve, reject) => {
+            void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
+        });
+    }
 });

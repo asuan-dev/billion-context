@@ -1,4 +1,5 @@
 import { createInitialState, type CompressionState, type CoreMessage } from "acp-kernel";
+import { createHash } from "node:crypto";
 import { getStore } from "./persist.js";
 
 export type BlockView = { text: string; count: number };
@@ -278,6 +279,48 @@ export function listSessions(): Session[] {
  *  conversation it has never seen. */
 export function peekSession(id: string): Session | undefined {
     return sessions.get(id);
+}
+
+// #760b: unified canonical session id. Every session exposes a stable pfa-* id
+// that MCP tools route by, independent of what the client calls itself.
+// Anonymous sessions already ARE pfa-* (PFA-minted session.id), so their
+// canonical id is session.id itself. Legacy (client-id) sessions derive a
+// stable pfa-* from their session id — deterministic, so the value survives even
+// if the persisted copy is lost. It is materialized onto metadata.canonicalId
+// (persisted) on first use so lookups are cheap and the value is inspectable.
+function derivedLegacyCanonicalId(sessionId: string): string {
+    return `pfa-${createHash("sha256").update(`legacy:${sessionId}`).digest("hex").slice(0, 16)}`;
+}
+
+/** Pure: the session's canonical id (always pfa-*). Never mutates. */
+function canonicalIdOf(session: Session): string {
+    if (session.id.startsWith("pfa-")) return session.id;
+    const c = session.metadata.canonicalId;
+    if (typeof c === "string" && c.length > 0) return c;
+    return derivedLegacyCanonicalId(session.id);
+}
+
+/** Materialize + persist the session's canonical id (idempotent) and return it.
+ *  Called where the id is surfaced to the model (wire notes) so the exact value
+ *  shown is the one persisted and routable. Anonymous sessions are a no-op
+ *  (canonical id already equals session.id). */
+export function ensureCanonicalId(session: Session): string {
+    const id = canonicalIdOf(session);
+    if (!session.id.startsWith("pfa-") && session.metadata.canonicalId !== id) {
+        session.metadata.canonicalId = id;
+        markDirty(session);
+    }
+    return id;
+}
+
+/** Read-only reverse lookup: the resident session whose canonical id matches.
+ *  Scans the in-memory pool (≤ MAX_SESSIONS); always consistent with the live
+ *  session set — no separate index to desync on evict/load. */
+export function findSessionByCanonicalId(canonicalId: string): Session | undefined {
+    for (const s of sessions.values()) {
+        if (canonicalIdOf(s) === canonicalId) return s;
+    }
+    return undefined;
 }
 
 /** Overwrite the session's full-conversation snapshot with the latest client

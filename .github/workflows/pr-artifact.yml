@@ -60,7 +60,7 @@ jobs:
                       dist/
                   retention-days: 30
 
-            - name: Comment on PR with install instructions
+            - name: Summarize install instructions and comment on same-repository PR
               uses: actions/github-script@v7
               with:
                   script: |
@@ -99,8 +99,11 @@ jobs:
                           '```',
                           '',
                           '---',
-                          '*This comment is automatically updated on each push.*',
+                          '*Install instructions are refreshed on each push.*',
                       ].join('\n');
+
+                      await core.summary.addRaw(body).write();
+                      if (isFork) return;
 
                       // Find and update existing comment, or create new one
                       const comments = await github.rest.issues.listComments({

@@ -147,3 +147,32 @@ test("newerFallback picks the newer source, tolerating missing sides", () => {
     assert.equal(newerFallback(now, 0), "disk");
     assert.equal(newerFallback(undefined, 0), "none");
 });
+
+test("prefixed relay/vLLM ids reach the registry via the bare basename (#736)", () => {
+    _setForTest({
+        "alibaba/qwen3.8-27b": { limit: { context: 262_144 } },
+    });
+    // The exact #736 shape: vLLM serves "qwen/qwen3.8-27b" while models.dev
+    // only knows "alibaba/qwen3.8-27b". The exact key misses and the
+    // full-name suffix scan looks for keys ending in "/qwen/qwen3.8-27b" —
+    // only the bare-basename fallback reaches the cross-provider scan.
+    assert.equal(peekRegistryContext("qwen/qwen3.8-27b", "localhost:1234"), 262_144);
+    assert.equal(peekRegistryContext("qwen/qwen3.8-27b"), 262_144);
+});
+
+test("a genuinely listed prefixed id outranks the bare-basename fallback (#736)", () => {
+    _setForTest({
+        "relay/gpt-x": { limit: { context: 100_000 } },
+        "other/gpt-x": { limit: { context: 999_999 } },
+    });
+    assert.equal(peekRegistryContext("relay/gpt-x", "some-relay.example"), 100_000);
+    _setForTest({
+        "other/gpt-x": { limit: { context: 999_999 } },
+    });
+    assert.equal(peekRegistryContext("relay/gpt-x", "some-relay.example"), 999_999);
+});
+
+test("bundled snapshot resolves the #736 vLLM name offline", () => {
+    const ctx = bundledSnapshotLookup("qwen/qwen3.8-27b");
+    assert.ok(typeof ctx === "number" && ctx >= 200_000, `snapshot should resolve qwen/qwen3.8-27b via alibaba/qwen3.8-27b (got ${ctx})`);
+});

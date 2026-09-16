@@ -5,6 +5,12 @@
 // POST /__bili/plugin/tool. Claude Code passes its session id via the MCP
 // initialize request's _meta.ui.sessionId (documented SessionStart context);
 // we also accept BILI_CONVERSATION_ID env (codex spawn-time registration).
+// #760: a fourth channel for hosts that share ONE shim across several
+// concurrent conversations (no env/meta session at all): every tool accepts an
+// optional conversation_id argument the model copies from the proxy's notes,
+// which overrides the default binding for that one call only. No registration
+// is issued for per-call ids — the proxy resolves them directly and flips the
+// target session to plugin mode on successful execution.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -70,7 +76,9 @@ const IDENTITY_BINDING = Boolean(process.env.CLAUDE_CODE_SESSION_ID?.trim());
 const ORPHAN_ADOPT = IDENTITY_BINDING && process.env.BILI_MCP_NO_ORPHAN_ADOPT !== "1";
 let manifestTools: McpToolDef[] = [];
 let conversationId = CONVERSATION_FROM_ENV;
-let registered = false;
+// #760: every conversation this shim has ever registered — the default
+// binding plus any per-call ids seen so far (issue-once each).
+const registeredConversations = new Set<string>();
 let initialized = false;
 function send(msg: unknown): void {
     process.stdout.write(JSON.stringify(msg) + "\n");
@@ -105,14 +113,15 @@ function ensureManifest(): Promise<void> {
     return manifestPromise;
 }
 
-export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS): Promise<string> {
+export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS, conversationIdOverride: string | undefined = undefined): Promise<string> {
+    const effectiveConversationId = conversationIdOverride ?? conversationId;
     for (let attempt = 0; ; attempt++) {
         let res: Response;
         try {
             res = await fetch(`${resolveProxyOrigin()}/__bili/plugin/tool`, {
                 method: "POST",
                 headers: { "content-type": "application/json" },
-                body: JSON.stringify({ conversationId, tool, args }),
+                body: JSON.stringify({ conversationId: effectiveConversationId, tool, args }),
                 signal: AbortSignal.timeout(timeoutMs),
             });
         } catch (err) {
@@ -123,9 +132,11 @@ export async function forwardTool(tool: string, args: unknown, timeoutMs: number
         if (res.ok && data.ok) return data.result ?? "";
         // #656: the shim's captured id was never registered — the host likely
         // resumed its session and forked a new id after this shim spawned.
-        // Adopt the proxy's latest active conversation and retry once.
+        // Adopt the proxy's latest active conversation and retry once. Armed
+        // for DEFAULT-bound calls only: a per-call (#760) id naming an unknown
+        // session must fail loudly, never adopt a sibling conversation.
         if (
-            res.status === 404 && attempt === 0 && ORPHAN_ADOPT && conversationId &&
+            res.status === 404 && attempt === 0 && ORPHAN_ADOPT && conversationIdOverride === undefined && conversationId &&
             typeof data.error === "string" && data.error.includes("no model request has arrived")
         ) {
             if (await adoptLatestActiveConversation()) continue;
@@ -181,14 +192,14 @@ async function handleMessage(msg: {
             const fromMeta = params._meta?.ui?.sessionId?.trim();
             if (fromMeta) conversationId ??= fromMeta;
             initialized = true;
-            if (conversationId && !registered) {
+            if (conversationId && !registeredConversations.has(conversationId)) {
                 const registerFetch = fetch(`${resolveProxyOrigin()}/__bili/plugin/register`, {
                     method: "POST",
                     headers: { "content-type": "application/json" },
                     body: JSON.stringify({ conversationId, agent: "mcp", identity: IDENTITY_BINDING }),
                     signal: AbortSignal.timeout(5000),
                 });
-                registered = true; // issue-once: a repeated initialize must not re-register
+                registeredConversations.add(conversationId); // issue-once: a repeated initialize must not re-register
                 if (IDENTITY_BINDING) {
                     // Identity-mode binding survives any arrival order —
                     // respond immediately so pipelined hosts are not stuck
@@ -225,20 +236,28 @@ async function handleMessage(msg: {
         }
         case "tools/call": {
             const tool = typeof params.name === "string" ? params.name : "";
-            const args = params.arguments && typeof params.arguments === "object" ? params.arguments : {};
+            const rawArgs: Record<string, unknown> = params.arguments && typeof params.arguments === "object" ? (params.arguments as Record<string, unknown>) : {};
             if (!tool) {
                 sendError(id, ERR_TOOL, "params.name is required");
                 return;
             }
-            if (!conversationId) {
-                sendError(id, ERR_TOOL, "no conversation id (set BILI_CONVERSATION_ID or connect via Claude Code MCP session meta)");
+            // #760: per-call conversation_id — the model copies the id the
+            // proxy printed in its notes ("your bili conversation id: …").
+            // Overrides the default binding (env/meta); stripped before
+            // forwarding since the proxy routes on the body-level field.
+            const perCallRaw = rawArgs.conversation_id;
+            const perCall = typeof perCallRaw === "string" ? perCallRaw.trim() : "";
+            const args = { ...rawArgs };
+            delete args.conversation_id;
+            if (!perCall && !conversationId) {
+                sendError(id, ERR_TOOL, "no conversation id (pass the conversation_id argument — see the 'your bili conversation id' line in the proxy notes — or set BILI_CONVERSATION_ID or connect via Claude Code MCP session meta)");
                 return;
             }
             try {
-                const text = await forwardTool(tool, args);
+                const text = await forwardTool(tool, args, TOOL_TIMEOUT_MS, perCall || undefined);
                 sendResult(id, { content: [{ type: "text", text }], isError: false });
             } catch (err) {
-                // Tool-level failures are results (isError), not JSON-RPC
+                // Protocol failures are results (isError), not JSON-RPC
                 // errors, so the host surfaces them to the model.
                 sendResult(id, { content: [{ type: "text", text: `bili tool error: ${err instanceof Error ? err.message : String(err)}` }], isError: true });
             }

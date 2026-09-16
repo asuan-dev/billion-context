@@ -338,7 +338,16 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     };
                     const proxyBase = detectProxyBase(ctx.model?.baseUrl);
                     if (proxyBase === undefined) {
-                        notify("bili: no proxy detected (run via `bili <client>` or set a /bili/ baseURL)", "warning");
+                        // #788: neutral wording — the plugin also loads under plain
+                        // pi/omp launches where the user never intended proxy mode
+                        // (e.g. they use billion-context-pi in-process instead), so
+                        // offer both exits instead of assuming proxy intent.
+                        const removeHint = agent === "pi"
+                            ? ", or remove this plugin (`bili plugin remove pi`) if you use billion-context-pi or don't want a proxy"
+                            : agent === "omp"
+                                ? ", or remove this plugin (`bili plugin remove omp`) if you don't want a proxy"
+                                : "";
+                        notify(`bili: no proxy detected — run via \`bili ${agent}\` (or set a /bili/ baseURL) to use proxy mode${removeHint}`, "warning");
                         return;
                     }
                     const conversationId = sessionIdOf(ctx) ?? "unknown";

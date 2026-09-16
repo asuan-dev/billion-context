@@ -210,6 +210,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             const pending = new Map<number, ToolUseBuffer>();
             let roundInput: number | undefined;
             let roundCached: number | undefined;
+            let roundCreation: number | undefined;
             let roundOutput: number | undefined;
             let stopReason: string | undefined;
             let usageYielded = false;
@@ -252,6 +253,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     const u = (msg.usage ?? {}) as Record<string, unknown>;
                     if (typeof u.input_tokens === "number") roundInput = u.input_tokens;
                     if (typeof u.cache_read_input_tokens === "number") roundCached = u.cache_read_input_tokens;
+                    if (typeof u.cache_creation_input_tokens === "number") roundCreation = u.cache_creation_input_tokens;
                     if (round === 1) {
                         // The raw message_start (with the provider's measured
                         // usage) reaches the host verbatim — no rewriting.
@@ -347,6 +349,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     if (typeof u.output_tokens === "number") roundOutput = u.output_tokens;
                     const input = typeof u.input_tokens === "number" ? u.input_tokens : undefined;
                     const cached = typeof u.cache_read_input_tokens === "number" ? u.cache_read_input_tokens : undefined;
+                    const creation = typeof u.cache_creation_input_tokens === "number" ? u.cache_creation_input_tokens : undefined;
                     if (input !== undefined && input > 0 && cached !== undefined) {
                         // Complete authoritative usage object — e.g. the synthetic
                         // terminal of a stitched multi-round stream (round1
@@ -355,9 +358,12 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         // compress re-request — overwrites the stale value carried by
                         // an earlier round's message_start. Per-field merging would
                         // double-count (new input + old cache) and trip false
-                        // EMERGENCY nudges (issue #299).
+                        // EMERGENCY nudges (issue #299). The cache-write segment
+                        // (#790) is optional even in a complete object — adopt it
+                        // when present, keep the prior value when absent.
                         roundInput = input;
                         roundCached = cached;
+                        if (creation !== undefined) roundCreation = creation;
                     } else {
                         // Incomplete usage object: the input context is FIXED within
                         // a turn, so message_start is authoritative for input/cache
@@ -369,6 +375,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         // legitimate update, so adopt only > 0.
                         if (input !== undefined && input > 0) roundInput = input;
                         if (cached !== undefined && cached > 0) roundCached = cached;
+                        if (creation !== undefined && creation > 0) roundCreation = creation;
                     }
                     const d = (data.delta ?? {}) as Record<string, unknown>;
                     if (typeof d.stop_reason === "string") stopReason = d.stop_reason;
@@ -379,6 +386,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             inputTokens: roundInput,
                             outputTokens: roundOutput,
                             cachedTokens: roundCached,
+                            creationTokens: roundCreation,
                         } as ParsedStreamEvent;
                     }
                     maybeWarnDegenerate(stopReason);
@@ -398,6 +406,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             inputTokens: roundInput,
                             outputTokens: roundOutput,
                             cachedTokens: roundCached,
+                            creationTokens: roundCreation,
                         } as ParsedStreamEvent;
                     }
                     maybeWarnDegenerate(stopReason);

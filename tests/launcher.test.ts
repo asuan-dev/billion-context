@@ -28,6 +28,8 @@ import {
     buildClaudeEnv,
     buildCodexArgs,
     prepareOpencodeHttpRewrite,
+    opencodeMajorVersion,
+    parseOpencodeMajor,
     stripInheritedProxy,
     resolvePiHome,
     resolveOmpHome,
@@ -60,6 +62,7 @@ import {
     prepareCodexMcpInjection,
     resolveCodexHome,
     readOpencodeConfig,
+    readOpencodeConfigRoot,
     resolveOpencodeConfigFile,
     findFreePort,
     ensureProxyRunning,
@@ -1777,44 +1780,200 @@ test("discoverRoutes(opencode): HTTP baseURL → /bili/ rewrite, HTTPS → MITM 
     assert.deepEqual(routes.httpsDomains, ["open.bigmodel.cn"]);
 });
 
-test("prepareOpencodeHttpRewrite: writes rewritten copy, original untouched", () => {
+test("readOpencodeConfig: parses JSONC (comments + trailing commas)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-jsonc-"));
+    try {
+        const cfgFile = path.join(dir, "opencode.jsonc");
+        fs.writeFileSync(
+            cfgFile,
+            [
+                "{",
+                "    // opencode accepts JSONC in every config file",
+                '    "provider": {',
+                '        "local": {',
+                '            "options": { "baseURL": "http://127.0.0.1:18081/v1", },',
+                "        },",
+                "    },",
+                "}",
+            ].join("\n"),
+        );
+        const cfg = readOpencodeConfig(cfgFile);
+        assert.deepEqual(cfg.providers["local"], { baseURL: "http://127.0.0.1:18081/v1" });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("readOpencodeConfigRoot: merges config.json → opencode.json → opencode.jsonc, OPENCODE_CONFIG wins", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-merge-"));
+    try {
+        const ocDir = path.join(dir, "opencode");
+        fs.mkdirSync(ocDir);
+        // opencode seeds a near-empty .jsonc when no config exists — the merge must
+        // still surface the real provider living in opencode.json (#796: single-file
+        // .jsonc-preference would miss it).
+        fs.writeFileSync(path.join(ocDir, "opencode.jsonc"), JSON.stringify({ $schema: "https://opencode.ai/config.json" }));
+        fs.writeFileSync(
+            path.join(ocDir, "opencode.json"),
+            JSON.stringify({
+                provider: {
+                    fromjson: { options: { baseURL: "http://from.json/v1" } },
+                    dup: { options: { baseURL: "http://dup-json/v1" }, models: { m: { limit: 4096 } } },
+                },
+            }),
+        );
+        fs.writeFileSync(path.join(ocDir, "config.json"), JSON.stringify({}));
+
+        const env = { XDG_CONFIG_HOME: dir };
+        const root = readOpencodeConfigRoot(env);
+        assert.ok(root);
+        assert.deepEqual((root.provider as Record<string, { options: { baseURL: string } }> | undefined)?.fromjson, { options: { baseURL: "http://from.json/v1" } } );
+
+        // later files win on conflicting keys; providers from earlier files survive
+        // a later file that also carries a top-level provider key (deep merge, like
+        // opencode's own loader — a top-level spread would drop them)
+        fs.writeFileSync(
+            path.join(ocDir, "opencode.jsonc"),
+            JSON.stringify({
+                provider: { wins: { options: { baseURL: "http://from.jsonc/v1" } }, dup: { options: { baseURL: "http://dup-jsonc/v1" } } },
+                $schema: "https://opencode.ai/config.json",
+            }),
+        );
+        const merged = readOpencodeConfigRoot(env);
+        const providers = (merged?.provider as Record<string, { options: { baseURL: string }; models?: Record<string, { limit: number }> }>) ?? {};
+        assert.equal(providers.wins?.options.baseURL, "http://from.jsonc/v1");
+        assert.equal(providers.fromjson?.options.baseURL, "http://from.json/v1");
+        assert.equal(providers.dup?.options.baseURL, "http://dup-jsonc/v1");
+        assert.deepEqual(providers.dup?.models, { m: { limit: 4096 } });
+
+        // OPENCODE_CONFIG layers over the global merge (opencode loads the globals
+        // first and merges the explicit file on top — it does not replace them)
+        const directFile = path.join(dir, "direct.json");
+        fs.writeFileSync(
+            directFile,
+            JSON.stringify({ provider: { direct: { options: { baseURL: "http://direct/v1" } }, wins: { options: { baseURL: "http://direct-wins/v1" } } } }),
+        );
+        const direct = readOpencodeConfigRoot({ XDG_CONFIG_HOME: dir, OPENCODE_CONFIG: directFile });
+        const directProviders = (direct?.provider as Record<string, { options: { baseURL: string } }>) ?? {};
+        assert.equal(directProviders.direct?.options.baseURL, "http://direct/v1");
+        assert.equal(directProviders.wins?.options.baseURL, "http://direct-wins/v1");
+        assert.equal(directProviders.fromjson?.options.baseURL, "http://from.json/v1");
+
+        assert.equal(readOpencodeConfigRoot({ XDG_CONFIG_HOME: path.join(dir, "empty-xdg") }), undefined);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("prepareOpencodeHttpRewrite: writes rewritten copy from a JSONC user config, original untouched", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-rw-"));
     try {
-        const cfgFile = path.join(dir, "opencode.json");
-        const original = JSON.stringify({
-            plugin: ["opencode-acp@latest"],
-            provider: { "zhipuai-lb": { options: { baseURL: "http://127.0.0.1:18081/v1" } } },
-        });
+        const cfgFile = path.join(dir, "opencode.jsonc");
+        const original = [
+            "{",
+            "    // plugin list rides along",
+            '    "plugin": ["opencode-acp@latest"],',
+            '    "provider": { "zhipuai-lb": { "options": { "baseURL": "http://127.0.0.1:18081/v1" } } },',
+            "}",
+        ].join("\n");
         fs.writeFileSync(cfgFile, original);
+        // empty-xdg keeps this hermetic: OPENCODE_CONFIG layers over whatever
+        // lives in the global dir, so point that dir somewhere empty
+        const root = readOpencodeConfigRoot({ XDG_CONFIG_HOME: path.join(dir, "empty-xdg"), OPENCODE_CONFIG: cfgFile });
         const rw = [{ key: "zhipuai-lb", realUpstream: "http://127.0.0.1:18081/v1" }];
-        const tmpFile = prepareOpencodeHttpRewrite(cfgFile, "http://127.0.0.1:8787", rw, []);
+        const tmpFile = prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", rw, []);
         assert.ok(tmpFile);
         const rewritten = JSON.parse(fs.readFileSync(tmpFile, "utf8"));
         assert.equal(rewritten.provider["zhipuai-lb"].options.baseURL, "http://127.0.0.1:8787/bili/http://127.0.0.1:18081/v1");
         assert.deepEqual(rewritten.plugin, ["opencode-acp@latest"]);
+        assert.deepEqual(rewritten.compaction, { auto: false });
         assert.equal(fs.readFileSync(cfgFile, "utf8"), original);
+        // the caller's merged root must stay pristine (rewrite happens on a clone)
+        assert.deepEqual(root, { plugin: ["opencode-acp@latest"], provider: { "zhipuai-lb": { options: { baseURL: "http://127.0.0.1:18081/v1" } } } });
         fs.rmSync(path.dirname(tmpFile), { recursive: true, force: true });
-        assert.equal(prepareOpencodeHttpRewrite(cfgFile, "http://127.0.0.1:8787", [], []), undefined);
-        const withPlugin = prepareOpencodeHttpRewrite(cfgFile, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js");
+        assert.equal(prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", [], []), undefined);
+        const withPlugin = prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js");
         assert.ok(withPlugin);
         const injected = JSON.parse(fs.readFileSync(withPlugin, "utf8"));
         assert.deepEqual(injected.plugin, ["opencode-acp@latest", "/opt/bili/dist/agent/opencode.js"]);
         assert.equal(injected.provider["zhipuai-lb"].options.baseURL, "http://127.0.0.1:18081/v1");
         fs.rmSync(path.dirname(withPlugin), { recursive: true, force: true });
-        const missingCfg = prepareOpencodeHttpRewrite(path.join(dir, "nope.json"), "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js");
+        const missingCfg = prepareOpencodeHttpRewrite(undefined, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js");
         assert.ok(missingCfg);
         const fromEmpty = JSON.parse(fs.readFileSync(missingCfg, "utf8"));
         assert.deepEqual(fromEmpty.plugin, ["/opt/bili/dist/agent/opencode.js"]);
+        assert.deepEqual(fromEmpty.compaction, { auto: false });
         fs.rmSync(path.dirname(missingCfg), { recursive: true, force: true });
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }
 });
 
-test("resolveOpencodeConfigFile: OPENCODE_CONFIG wins, XDG fallback", () => {
+test("prepareOpencodeHttpRewrite: pluginDirMode wraps the plugin in an index.js shim dir", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-rw2-"));
+    try {
+        const tmpFile = prepareOpencodeHttpRewrite({ provider: {} }, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js", true);
+        assert.ok(tmpFile);
+        const injected = JSON.parse(fs.readFileSync(tmpFile, "utf8"));
+        const entry = injected.plugin[injected.plugin.length - 1];
+        assert.ok(entry !== "/opt/bili/dist/agent/opencode.js");
+        assert.ok(fs.statSync(entry).isDirectory());
+        const shim = fs.readFileSync(path.join(entry, "index.js"), "utf8");
+        assert.match(shim, /export \{ default \} from "\/opt\/bili\/dist\/agent\/opencode\.js";/);
+        assert.deepEqual(injected.compaction, { auto: false });
+        fs.rmSync(path.dirname(tmpFile), { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("opencodeMajorVersion: parses --version output, defaults to 1 on failure", () => {
+    assert.equal(parseOpencodeMajor("opencode v2.0.3"), 2);
+    assert.equal(parseOpencodeMajor("1.14.46"), 1);
+    assert.equal(parseOpencodeMajor("no digits here"), undefined);
+    assert.equal(opencodeMajorVersion("/nonexistent/bili-test-bin"), 1);
+    if (process.platform === "win32") return; // shebang fakes are not executable on Windows
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-ver-"));
+    try {
+        const mk = (name: string, out: string): string => {
+            const f = path.join(dir, name);
+            fs.writeFileSync(f, `#!/bin/sh\necho "${out}"\n`);
+            fs.chmodSync(f, 0o755);
+            return f;
+        };
+        assert.equal(opencodeMajorVersion(mk("oc-v2.sh", "opencode v2.0.3")), 2);
+        assert.equal(opencodeMajorVersion(mk("oc-v1.sh", "1.14.46")), 1);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("resolveOpencodeConfigFile: OPENCODE_CONFIG wins; first existing file, .jsonc preferred", () => {
     assert.equal(resolveOpencodeConfigFile({ OPENCODE_CONFIG: "/tmp/x.json" }), "/tmp/x.json");
-    const p = resolveOpencodeConfigFile({ XDG_CONFIG_HOME: "/tmp/xdg" });
-    assert.ok(p.endsWith(path.join("opencode", "opencode.json")));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-res-"));
+    try {
+        const ocDir = path.join(dir, "opencode");
+        fs.mkdirSync(ocDir);
+        const env = { XDG_CONFIG_HOME: dir };
+        // none exists → .jsonc path (opencode's preferred file)
+        assert.ok(resolveOpencodeConfigFile(env).endsWith(path.join("opencode", "opencode.jsonc")));
+        // only .json → .json
+        const jsonFile = path.join(ocDir, "opencode.json");
+        fs.writeFileSync(jsonFile, "{}");
+        assert.equal(resolveOpencodeConfigFile(env), jsonFile);
+        // .jsonc appears → wins
+        const jsoncFile = path.join(ocDir, "opencode.jsonc");
+        fs.writeFileSync(jsoncFile, "{}");
+        assert.equal(resolveOpencodeConfigFile(env), jsoncFile);
+        // config.json is last
+        fs.rmSync(jsoncFile);
+        fs.rmSync(jsonFile);
+        const legacyFile = path.join(ocDir, "config.json");
+        fs.writeFileSync(legacyFile, "{}");
+        assert.equal(resolveOpencodeConfigFile(env), legacyFile);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
 });
 
 test("parseHermesYaml: v12 providers dict + legacy custom_providers list", () => {

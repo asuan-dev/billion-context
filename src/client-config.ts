@@ -5,6 +5,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { parse as parseJsonc, type ParseError } from "jsonc-parser";
 
 export interface ClaudeSettings {
     anthropicBaseUrl?: string;
@@ -873,28 +874,84 @@ export function readHermesConfig(hermesHome: string): HermesConfig {
     return parseHermesYaml(text);
 }
 
+export const OPENCODE_CONFIG_FILES = ["opencode.jsonc", "opencode.json", "config.json"] as const;
+
 export function resolveOpencodeConfigFile(env: NodeJS.ProcessEnv): string {
     if (nonEmpty(env.OPENCODE_CONFIG)) return env.OPENCODE_CONFIG;
     const xdg = nonEmpty(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : path.join(os.homedir(), ".config");
-    return path.join(xdg, "opencode", "opencode.json");
+    // Mirror opencode's own discovery (globalConfigFile): first existing file, .jsonc preferred.
+    const dir = path.join(xdg, "opencode");
+    for (const file of OPENCODE_CONFIG_FILES) {
+        const candidate = path.join(dir, file);
+        if (fs.existsSync(candidate)) return candidate;
+    }
+    return path.join(dir, "opencode.jsonc");
 }
 
-export function readOpencodeConfig(file: string): OpencodeConfig {
-    let text: string;
-    try {
-        text = fs.readFileSync(file, "utf8");
-    } catch {
-        return { providers: {} };
-    }
+// opencode accepts JSONC (comments, trailing commas) in every config file; a strict
+// JSON.parse silently yields "no config" for .jsonc users.
+export function parseConfigText(text: string): Record<string, unknown> | undefined {
     let parsed: unknown;
     try {
         parsed = JSON.parse(text);
     } catch {
-        return { providers: {} };
+        const errors: ParseError[] = [];
+        parsed = parseJsonc(text, errors, { allowTrailingComma: true });
     }
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+    return undefined;
+}
+
+function readConfigFileRoot(file: string): Record<string, unknown> | undefined {
+    try {
+        return parseConfigText(fs.readFileSync(file, "utf8"));
+    } catch {
+        return undefined;
+    }
+}
+
+// Deep merge mirroring opencode's own loader (remeda mergeDeep): plain objects
+// recurse, arrays/primitives are replaced by the later file. Top-level spread
+// would drop earlier files' provider entries whenever a later file also has a
+// top-level provider key.
+function mergeConfigDeep(target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown> {
+    const out: Record<string, unknown> = { ...target };
+    for (const [key, value] of Object.entries(source)) {
+        const existing = out[key];
+        out[key] =
+            value !== null && typeof value === "object" && !Array.isArray(value) &&
+            existing !== null && typeof existing === "object" && !Array.isArray(existing)
+                ? mergeConfigDeep(existing as Record<string, unknown>, value as Record<string, unknown>)
+                : value;
+    }
+    return out;
+}
+
+// Mirror opencode's global merge (config.json → opencode.json → opencode.jsonc,
+// later wins). Needed because opencode seeds a near-empty opencode.jsonc when no
+// config exists yet, so single-file reads miss the real config in opencode.json.
+// A user-set OPENCODE_CONFIG is layered ON TOP of that merge — opencode loads
+// the globals first and merges the explicit file over them, it does not replace
+// them — so providers living only in the global files stay visible.
+export function readOpencodeConfigRoot(env: NodeJS.ProcessEnv): Record<string, unknown> | undefined {
+    let root: Record<string, unknown> | undefined;
+    const xdg = nonEmpty(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : path.join(os.homedir(), ".config");
+    const dir = path.join(xdg, "opencode");
+    for (const file of ["config.json", "opencode.json", "opencode.jsonc"]) {
+        const next = readConfigFileRoot(path.join(dir, file));
+        if (next !== undefined) root = root === undefined ? next : mergeConfigDeep(root, next);
+    }
+    if (nonEmpty(env.OPENCODE_CONFIG)) {
+        const next = readConfigFileRoot(env.OPENCODE_CONFIG);
+        if (next !== undefined) root = root === undefined ? next : mergeConfigDeep(root, next);
+    }
+    return root;
+}
+
+export function parseOpencodeProviders(parsed: Record<string, unknown> | undefined): OpencodeConfig {
     const providers: Record<string, OpencodeProvider> = {};
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        const root = parsed as Record<string, unknown>;
+    if (parsed !== undefined) {
+        const root = parsed;
         const provRoot = root.provider;
         if (provRoot && typeof provRoot === "object" && !Array.isArray(provRoot)) {
             for (const [name, value] of Object.entries(provRoot)) {
@@ -921,6 +978,10 @@ export function readOpencodeConfig(file: string): OpencodeConfig {
         }
     }
     return { providers };
+}
+
+export function readOpencodeConfig(file: string): OpencodeConfig {
+    return parseOpencodeProviders(readConfigFileRoot(file));
 }
 
 export function parseZcodeConfig(obj: unknown): ZcodeConfig {
@@ -967,7 +1028,7 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
     const zcodeHome = nonEmpty(env.ZCODE_DATA_BASE_DIR) ? env.ZCODE_DATA_BASE_DIR : path.join(home, ".zcode");
     config.zcode = readZcodeConfig(zcodeHome);
     config.omp = readOmpConfig(resolveOmpHome(env));
-    config.opencode = readOpencodeConfig(resolveOpencodeConfigFile(env));
+    config.opencode = parseOpencodeProviders(readOpencodeConfigRoot(env));
     config.hermes = readHermesConfig(resolveHermesHome(env));
     config.dsh = readDshConfig(resolveDshHome(env));
     config.codebuddy = readCodebuddyConfig(resolveCodebuddyHome(env), cwd, env);

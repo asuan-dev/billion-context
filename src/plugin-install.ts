@@ -126,11 +126,16 @@ function piInstall(): string {
     const settings = readJson(file);
     const packages = Array.isArray(settings.packages) ? (settings.packages as unknown[]).map(String) : [];
     if (packages.some((p) => p === root)) return `pi: already installed (${file})`;
+    const removed = packages.filter((p) => isPiEntry(p, root));
     const kept = packages.filter((p) => !isPiEntry(p, root));
     kept.push(root);
     settings.packages = kept;
     writeJson(file, settings);
-    return `pi: installed -> ${file} packages += ${root}`;
+    // #788: dropped entries must be visible — silently replacing a documented
+    // setup (npm:billion-context-pi) left users with no compression and no
+    // idea their config changed.
+    const note = removed.length > 0 ? `\npi: replaced existing entries: ${removed.join(", ")}` : "";
+    return `pi: installed -> ${file} packages += ${root}${note}`;
 }
 
 function piRemove(): string {
@@ -138,11 +143,12 @@ function piRemove(): string {
     const file = piSettingsFile();
     const settings = readJson(file);
     const packages = Array.isArray(settings.packages) ? (settings.packages as unknown[]).map(String) : [];
-    const kept = packages.filter((p) => !isPiEntry(p, root));
-    if (kept.length === packages.length) return `pi: not installed (${file})`;
-    settings.packages = kept;
+    const removed = packages.filter((p) => isPiEntry(p, root));
+    if (removed.length === 0) return `pi: not installed (${file})`;
+    settings.packages = packages.filter((p) => !isPiEntry(p, root));
     writeJson(file, settings);
-    return `pi: removed from ${file}`;
+    // #788: same visibility rule as install — removed entries are reported.
+    return `pi: removed from ${file}\npi: removed entries: ${removed.join(", ")}`;
 }
 
 function piStatus(): string {

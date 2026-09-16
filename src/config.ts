@@ -236,8 +236,16 @@ const CONTEXT_LIMIT_TABLE: Array<{ match: RegExp; limit: number }> = [
 
 export function lookupContextLimit(model: string | undefined): number | undefined {
     if (!model) return undefined;
-    for (const entry of CONTEXT_LIMIT_TABLE) {
-        if (entry.match.test(model)) return entry.limit;
+    // Relay/vLLM deployments serve models under "prefix/name" ids that miss
+    // every ^-anchored pattern ("meta-llama/Llama-4" vs /^llama-/i). Try the
+    // bare basename too; the full name keeps precedence (#736).
+    const roots = [model];
+    const slash = model.lastIndexOf("/");
+    if (slash > 0 && slash < model.length - 1) roots.push(model.slice(slash + 1));
+    for (const root of roots) {
+        for (const entry of CONTEXT_LIMIT_TABLE) {
+            if (entry.match.test(root)) return entry.limit;
+        }
     }
     return undefined;
 }
