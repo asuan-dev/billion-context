@@ -147,7 +147,7 @@ test("e2e #301: overflow + summary upstream 429 → structured 503, over-window 
     }
 });
 
-test("e2e #301: payload fits the window + preflight 429 → request still forwarded (no false positive)", async () => {
+test("e2e #301: payload fits the window + stale floor above it → forwarded, no summarization attempt", async () => {
     const calls: Call[] = [];
     let streamCalls = 0;
     const upstream = http.createServer((req, res) => {
@@ -200,10 +200,10 @@ test("e2e #301: payload fits the window + preflight 429 → request still forwar
             headers,
             body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: bigConversation() }),
         });
-        assert.equal(r2.status, 200, "a fitting payload is forwarded even when preflight 429s");
+        assert.equal(r2.status, 200, "a fitting payload is forwarded without a summarization attempt");
         await r2.text();
 
-        assert.ok(calls.filter((c) => !c.stream).length >= 1, "preflight did attempt the (429'd) summarization call");
+        assert.equal(calls.filter((c) => !c.stream).length, 0, "preflight skips the walk entirely: the stale floor fits nothing to fold");
         assert.equal(calls.filter((c) => c.stream).length, 2, "both requests were forwarded upstream");
     } finally {
         proxy.close();

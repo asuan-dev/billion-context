@@ -3018,6 +3018,15 @@ async function preflightCompressIfNeeded(
         : Math.max(session.stats.lastInputTokens, payloadEstimate);
     if (limit <= 0 || !model || tokenCount < compressionTarget) return prepared;
     const payloadFitsWindow = (unknownBaseline ? tokenCount : payloadEstimate) < limit;
+    // #739: A stale measured baseline (e.g. an earlier as-is forward under
+    // preflight, #300) can pin session.stats.lastInputTokens above the window
+    // while the prepared payload itself fits. Running the walk then burns
+    // summarization calls folding ranges the payload no longer needs, and
+    // can fail-fast 502 a payload that would have forwarded fine (#301:
+    // forwarding as-is is safe when the payload's own estimate fits; the
+    // usage report self-heals the baseline). Keep folding inside the window:
+    // the codex headroom target (#300) legitimately walks fitting payloads.
+    if (!unknownBaseline && session.stats.lastInputTokens >= limit && payloadFitsWindow) return prepared;
     // #496 forward-once-then-learn: the default image cost (base64/4) matches byte
     // relays (#488) but overestimates pixel-tile upstreams (a 400KB JPEG ≈ 1.6K real
     // tokens, not ~133K), so an image-dominated payload can clear the window on ESTIMATE
