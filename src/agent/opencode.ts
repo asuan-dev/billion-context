@@ -9,7 +9,7 @@
 //   - renders the proxy's buildStatusPanel via an ignored chat message
 
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
-import { fetchProxyVersion, forwardTool, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary } from "./shared.js";
+import { fetchProxyVersion, forwardTool, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, armedIdleNotice, noSessionWarning } from "./shared.js";
 
 interface OpencodeCommandConfig {
     template: string;
@@ -112,9 +112,7 @@ const server = async (ctx: OpencodePluginContext): Promise<OpencodeHooks> => {
                     } catch {
                         version = undefined;
                     }
-                    text = version !== undefined
-                        ? `billion-context@${version} — proxy connected, no ACP session yet. Send a model request, then run /acp again.`
-                        : "bili: no ACP session yet (send a model request first, then run /acp)";
+                    text = version !== undefined ? armedIdleNotice(version) : noSessionWarning();
                 } else {
                     text = "bili: proxy returned no status panel";
                 }
