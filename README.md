@@ -445,8 +445,12 @@ Two lanes, same plugin (#941):
   `plugin status` all detect bundle-installed profiles and leave them alone
   (cordis rejects duplicate entry ids across layers, so a second
   `id: bili-native` insert would hard-fail dsh boot). Remove with
-  `dsh plugin --profile <name> remove billion-context`. Requires a published
-  release that carries `dsh.bundle.patch.yml`.
+   `dsh plugin --profile <name> remove billion-context`. Requires a published
+   release that carries `dsh.bundle.patch.yml`. If dsh fails to boot right
+   after an add with `ERR_MODULE_NOT_FOUND` on `billion-context/dsh`, the
+   profile resolved a pre-bundle copy from a stale package-metadata cache
+   (#953) — re-add pinned: `dsh plugin --profile <name> add
+   billion-context@latest`.
 
 Under a `bili dsh` launch the plugin ATTACHES to the launcher's proxy (no
 second spawn). Raw upstream URLs rewrite to `<proxy>/bili/<url>` like
