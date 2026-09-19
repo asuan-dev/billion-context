@@ -712,7 +712,7 @@ Where upstreams are discovered from (read-only):
 
 ### Generated files (what gets written — last resort only, #535)
 
-The launcher prefers file-free injection (env vars > CLI flags/extension APIs > generated files; see README, “Injection priority” section). Where a file is unavoidable it is a **copy** — the real config is never edited:
+The launcher prefers file-free injection (env vars > CLI flags/extension APIs > generated files; see TECHNICAL-NOTES.md, “Injection priority” section). Where a file is unavoidable it is a **copy** — the real config is never edited:
 
 - **pi / omp** — nothing is written (#535): provider baseUrls ride the `BILI_PROVIDER_REWRITES` env manifest consumed by the bili extension at load (`registerProvider`), and auto native compaction is cancelled in-extension (`session_before_compact`; omp distinguishes auto vs manual via the `auto_compaction_start` announcement, #851) — manual `/compact` stays user-owned. The real `~/.pi` / `~/.omp` homes are untouched.
 - **opencode** — a temp `opencode.json` pointed at by `OPENCODE_CONFIG` (removed when the client exits), with `/bili/`-rewritten plaintext baseURLs **plus the thin `/acp` plugin appended**. On OpenCode 1.x the `opencode-acp` entries are stripped from the clone (the host must not load it armed) and the thin plugin imports that same package as a library instead, gated on legacy sessions; the first stripped spec rides along via `BILI_OPENCODE_ACP_SPEC` so the bridge imports the exact copy the host would have loaded (#920). Relative local plugin specs (`./x`, `../x`) are re-anchored to absolute paths in the clone — opencode resolves them against the declaring config file's dir, which the clone no longer is (#826).

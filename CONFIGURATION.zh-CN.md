@@ -708,7 +708,7 @@ Claude Code 的 undici fetch 忽略 `HTTPS_PROXY`，所以证书 MITM 拦不到�
 
 ### 生成文件（写了什么 —— 最后手段，#535）
 
-启动器优先零文件注入（env > CLI 参数/扩展 API > 生成文件；见 [README —— 注入优先级](README.zh-CN.md)）。确实绕不开文件时写的都是**副本** —— 真实配置绝不编辑：
+启动器优先零文件注入（env > CLI 参数/扩展 API > 生成文件；见 [TECHNICAL-NOTES.zh-CN.md —— 注入优先级](TECHNICAL-NOTES.zh-CN.md)）。确实绕不开文件时写的都是**副本** —— 真实配置绝不编辑：
 
 - **pi / omp** —— 不写任何文件（#535）：provider baseUrl 走 `BILI_PROVIDER_REWRITES` env 清单，由 bili 扩展加载时消费（`registerProvider`）；自动原生压缩改由扩展内取消（`session_before_compact`，omp 按 `auto_compaction_start` 预告区分自动/手动，#851），手动 `/compact` 保持用户所有。真实 `~/.pi` / `~/.omp` 主目录原样不动。
 - **opencode** —— 临时 `opencode.json`（由 `OPENCODE_CONFIG` 指向，客户端退出时删除），明文 `baseURL` 重写为 `/bili/` 形式，**并追加了薄 `/acp` 插件**。OpenCode 1.x 下 `opencode-acp` 条目会从副本中移除（主机不得以激活状态加载它），改由薄插件把同一个包作为库导入、仅对 legacy 会话生效；首个被移除的 spec 经 `BILI_OPENCODE_ACP_SPEC` 传递，保证 bridge 导入的正是主机本会加载的那份拷贝（#920）。
