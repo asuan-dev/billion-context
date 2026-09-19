@@ -116,7 +116,7 @@ test("#349: empty compress args → actionable no-valid-ranges message (missing-
     const out = runApply(ctx, {});
     assert.ok(out.startsWith("[Compression FAILED"), `expected failure, got: ${out}`);
     assert.ok(out.includes("non-empty 'content' array"), `steers to a content array: ${out}`);
-    assert.ok(out.includes("startId, endId, summary"), `names the required fields: ${out}`);
+    assert.ok(["startId", "endId", "summary"].every((f) => out.includes(f)), `names the required fields: ${out}`);
     assert.ok(!out.includes("Check your startId/endId parameters"), "old misleading hint removed");
 });
 

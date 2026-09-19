@@ -13,10 +13,14 @@
 import {
     parseCompressArgs,
     ABSORB_TOOL_OPENAI,
+    COMPRESS_TOOL,
+    COMPRESS_TOOL_OPENAI,
+    COMPRESS_TOOL_RESPONSES,
     SEARCH_CONTEXT_TOOL,
     SEARCH_CONTEXT_TOOL_OPENAI,
     SEARCH_CONTEXT_TOOL_RESPONSES,
     SEARCH_CONTEXT_TOOL_NAME,
+    COMPRESS_TOOL_NAME,
     ACP_TOOLS_ANTHROPIC,
     ACP_TOOLS_OPENAI,
     ACP_TOOLS_RESPONSES,
@@ -102,10 +106,62 @@ export const BILI_SEARCH_CONTEXT_TOOL_RESPONSES = {
     parameters: withConversationId(SEARCH_CONTEXT_TOOL_RESPONSES.parameters),
 };
 
-export const BILI_ACP_TOOLS_ANTHROPIC = ACP_TOOLS_ANTHROPIC.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL : t));
-export const BILI_ACP_TOOLS_OPENAI = ACP_TOOLS_OPENAI.map((t) => (t.function.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_OPENAI : t));
-export const BILI_ACP_TOOLS_RESPONSES = ACP_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t));
-export const BILI_ACP_READONLY_TOOLS_RESPONSES = ACP_READONLY_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t));
+// compress-retry: hosts pre-validate tool args against the served schema and
+// reject a missing `content` CLIENT-side — the model only sees a bare
+// "content: is required" and, observed in production, gives up instead of
+// retrying. Softening `required` routes those calls to the executor, which
+// answers with the actionable [Compression FAILED ...] receipt (src/stream.ts
+// applyRanges) the model can fix in the same loop.
+const COMPRESS_RETRY_NOTE =
+    "\n\n[NOTE: `content` is validated when the call EXECUTES, not by the schema. An omitted or invalid `content` returns a retry error and compresses NOTHING — re-issue the call with content: [{startId, endId, summary}].]";
+
+function withoutRequiredContent(schema: JsonSchemaObject): JsonSchemaObject {
+    return { ...schema, required: (schema.required ?? []).filter((n) => n !== "content") };
+}
+
+export const BILI_COMPRESS_TOOL = {
+    ...COMPRESS_TOOL,
+    description: COMPRESS_TOOL.description + COMPRESS_RETRY_NOTE,
+    input_schema: withoutRequiredContent(COMPRESS_TOOL.input_schema),
+};
+
+export const BILI_COMPRESS_TOOL_OPENAI = {
+    ...COMPRESS_TOOL_OPENAI,
+    function: {
+        ...COMPRESS_TOOL_OPENAI.function,
+        description: COMPRESS_TOOL_OPENAI.function.description + COMPRESS_RETRY_NOTE,
+        parameters: withoutRequiredContent(COMPRESS_TOOL_OPENAI.function.parameters),
+    },
+};
+
+export const BILI_COMPRESS_TOOL_RESPONSES = {
+    ...COMPRESS_TOOL_RESPONSES,
+    description: COMPRESS_TOOL_RESPONSES.description + COMPRESS_RETRY_NOTE,
+    parameters: withoutRequiredContent(COMPRESS_TOOL_RESPONSES.parameters),
+};
+
+function replaceTool<T extends { name: string }>(toolList: T[], name: string, replacement: T): T[] {
+    return toolList.map((t) => (t.name === name ? replacement : t));
+}
+
+export const BILI_ACP_TOOLS_ANTHROPIC = replaceTool(
+    ACP_TOOLS_ANTHROPIC.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL : t)),
+    COMPRESS_TOOL_NAME,
+    BILI_COMPRESS_TOOL,
+);
+export const BILI_ACP_TOOLS_OPENAI = ACP_TOOLS_OPENAI
+    .map((t) => (t.function.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_OPENAI : t))
+    .map((t) => (t.function.name === COMPRESS_TOOL_NAME ? BILI_COMPRESS_TOOL_OPENAI : t));
+export const BILI_ACP_TOOLS_RESPONSES = replaceTool(
+    ACP_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t)),
+    COMPRESS_TOOL_NAME,
+    BILI_COMPRESS_TOOL_RESPONSES,
+);
+export const BILI_ACP_READONLY_TOOLS_RESPONSES = replaceTool(
+    ACP_READONLY_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t)),
+    COMPRESS_TOOL_NAME,
+    BILI_COMPRESS_TOOL_RESPONSES,
+);
 
 // The kernel ships no Responses-format absorb const (the four ACP tools have
 // *_RESPONSES variants; absorb is host-registered opt-in). Synthesize it in

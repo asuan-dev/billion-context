@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { ACP_READONLY_TOOLS_RESPONSES, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, createCore, createInitialState, defaultConfig } from "acp-kernel";
 import { anthropicToCore, type AnthropicRequestBody } from "acp-kernel/wire";
-import { BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES } from "../src/compress-tool.ts";
+import { BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME } from "../src/compress-tool.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetSessionsForTest, getSession, type Session } from "../src/session.ts";
 import { executeSearchContext, executeSearchContextTarget } from "../src/decompress-shared.ts";
@@ -78,8 +78,15 @@ test("#841 schema: BILI arrays add optional conversation_id to search_context on
         const kernelProps = paramsOf(kernelEntry!).properties as Record<string, unknown>;
         assert.equal(kernelProps.conversation_id, undefined, "kernel constant must not be mutated");
 
-        const biliRest = bili.filter((t) => t !== entry);
-        const kernelRest = kernel.filter((t) => t !== kernelEntry);
+        // #743: compress is the one other intentional BILI-vs-kernel delta
+        // (softened required + retry note); its schema is pinned in
+        // tests/compress-retry.test.ts.
+        const nameOf = (t: unknown): string | undefined => {
+            const e = t as FlatTool;
+            return shape === "openai" ? e.function?.name : e.name;
+        };
+        const biliRest = bili.filter((t) => t !== entry && nameOf(t) !== COMPRESS_TOOL_NAME);
+        const kernelRest = kernel.filter((t) => t !== kernelEntry && nameOf(t) !== COMPRESS_TOOL_NAME);
         assert.deepEqual(biliRest, kernelRest, "no other tool may change");
     }
     const ro = searchEntry(BILI_ACP_READONLY_TOOLS_RESPONSES, "flat")!;

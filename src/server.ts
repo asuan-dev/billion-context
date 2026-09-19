@@ -1810,6 +1810,39 @@ export function stripKernelSummaries(messages: BiliMessage[], state: Compression
     return messages.filter((m) => !(m.id ?? "").startsWith("acp_summary_") || !carried.has(m.id));
 }
 
+// compress-retry cleanup: a failed compress call is dead weight once its turn
+// has closed — the model either retried (the success replaces it) or moved on,
+// and stale failure text under sustained pressure teaches the wrong lesson.
+// Drop compress call+result PAIRS from closed turns (before the last user
+// message) whose result is a failure marker. Pairs in the CURRENT turn stay so
+// the model can still read the error and retry in place; successful compress
+// calls never match (no block was created) and remain as plugin-mode carriers.
+export function stripFailedCompressCalls(messages: CoreMessage[]): CoreMessage[] {
+    let lastUser = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i]!.role === "user") {
+            lastUser = i;
+            break;
+        }
+    }
+    if (lastUser < 0) return messages;
+    const limit = lastUser;
+    const compressCallIds = new Set<string>();
+    const failed = new Set<string>();
+    for (let i = 0; i < limit; i++) {
+        const m = messages[i]!;
+        if (m.contentType === "tool-call" && m.toolName === COMPRESS_TOOL_NAME && m.toolCallId) compressCallIds.add(m.toolCallId);
+    }
+    for (let i = 0; i < limit; i++) {
+        const m = messages[i]!;
+        const t = m.text ?? "";
+        if (m.contentType !== "tool-result" || !m.toolCallId || !compressCallIds.has(m.toolCallId)) continue;
+        if (t.includes("Compression FAILED") || t.includes('Validation failed for tool "compress"')) failed.add(m.toolCallId);
+    }
+    if (failed.size === 0) return messages;
+    return messages.filter((m) => !m.toolCallId || !failed.has(m.toolCallId));
+}
+
 // #564: folding + stripKernelSummaries can merge two assistant turns into one
 // run, which Responses rejects (run order reasoning* -> message* ->
 // function_call*, <=1 reasoning). Rebuild boundaries from the ORIGINAL history
@@ -2017,7 +2050,7 @@ function prepareAnthropic(
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
-        processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
+        processedMessages = stripReasoning(stripFailedCompressCalls(stripKernelSummaries(turn.messages, turn.state)));
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
@@ -2154,7 +2187,7 @@ function prepareOpenai(
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
-        processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
+        processedMessages = stripReasoning(stripFailedCompressCalls(stripKernelSummaries(turn.messages, turn.state)));
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = systemToUser(hardenOpenaiAssistantContent(coreToOpenai(processedMessages as BiliMessage[])));
@@ -2358,7 +2391,7 @@ function prepareResponses(
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !isCompactionTrigger && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
-        processedMessages = repairResponsesAssistantOrdering(stripReasoning(stripKernelSummaries(turn.messages, turn.state)), originalMessages);
+        processedMessages = repairResponsesAssistantOrdering(stripReasoning(stripFailedCompressCalls(stripKernelSummaries(turn.messages, turn.state))), originalMessages);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
         if (Array.isArray(rebuiltInput)) rebuiltInput = hoistTrappedToolItems(rebuiltInput);
