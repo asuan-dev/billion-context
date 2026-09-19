@@ -49,11 +49,10 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
 }
 
 /** Numeric part of a ref ("m00042" → 42, "b3" → 3); 0 for non-numeric. Used to
- * order ranges by position when picking the fold point (#189 observability). */
+ *  order ranges by position when picking the fold point (#189 observability). */
 function refNum(ref: string): number {
     return Number(ref.replace(/\D/g, "")) || 0;
 }
-
 
 export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx): string {
     const { ranges, diagnostics } = parsed;
@@ -105,7 +104,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         if (r.blocksCreated === 0) {
             const errs = r.errors.join("; ") || "no blocks created";
             ctx.log(`[acp-proxy: compress FAILED ${detail} → 0 blocks. ${errs}]`);
-        return `[Compression FAILED: ${errs}]`;
+            return `[Compression FAILED: ${errs}]`;
         }
 
         // #189 observability: record the rewrite magnitude + fold point so a
