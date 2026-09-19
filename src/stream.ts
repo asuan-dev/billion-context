@@ -54,6 +54,21 @@ function refNum(ref: string): number {
     return Number(ref.replace(/\D/g, "")) || 0;
 }
 
+/** Recovery hint appended to failed-compress receipts: the raw-ref span that
+ * is NOT covered by active blocks right now. Kernel errors tell the model to
+ * go run acp_status; a model that retries blind keeps anchoring on refs an
+ * earlier fold already consumed (01a0b0c4, 2026-09-18: three failed compresses
+ * with two full T1 checkpoints wasted, then it gave up). Handing the live
+ * span over kills the retry loop without another round-trip. */
+export function compressibleSpanHint(state: CompressionState): string {
+    const refs = Object.keys(state.messageRefs?.byRef ?? {});
+    const highest = refs.reduce((m, r) => Math.max(m, r.startsWith("m") ? Number(r.slice(1)) || 0 : 0), 0);
+    const boundary = state.blocks.reduce((m, b) => (b.endRef?.startsWith("m") ? Math.max(m, Number(b.endRef.slice(1)) || 0) : m), 0);
+    const fmt = (n: number) => `m${String(n).padStart(5, "0")}`;
+    if (highest <= boundary) return ` No raw refs are directly compressible right now — compress a run of ACTIVE blocks instead (e.g. startId b12, endId b15).`;
+    return ` Live compressible refs: ${fmt(boundary + 1)}–${fmt(highest)} (everything up to ${fmt(boundary)} is already inside active blocks). Retry NOW in this same turn with startId/endId inside that span.`;
+}
+
 
 export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx): string {
     const { ranges, diagnostics } = parsed;
@@ -61,7 +76,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         ctx.log("[acp-proxy: compress call had no valid ranges; nothing compressed.]");
         const reasons = diagnostics.invalidReasons?.slice(0, 8).map((r) => (r.length > 200 ? r.slice(0, 200) + "..." : r)) ?? [];
         const why = reasons.length > 0 ? ` Rejected entries:\n${reasons.map((r) => `- ${r}`).join("\n")}` : "";
-        return `[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}). NOTHING was compressed — the nudge is still pending.${why}\ncompress requires a non-empty 'content' array: compress({ content: [{ startId: "m00123", endId: "m00180", summary: "one short line per range" }] }). startId/endId are mNNNNN message refs from the conversation; get the current ranges from the nudge or acp_status. Retry NOW in this same turn — write your own summary text for each range, do not skip the compression.]`;
+        return `[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}). NOTHING was compressed — the nudge is still pending.${why}\ncompress requires a non-empty 'content' array: compress({ content: [{ startId: "m00123", endId: "m00180", summary: "one short line per range" }] }). startId/endId are mNNNNN message refs from the conversation; get the current ranges from the nudge or acp_status.${compressibleSpanHint(ctx.session.state)} Retry NOW in this same turn — write your own summary text for each range, do not skip the compression.]`;
     }
     ctx.log(`[acp-proxy: compress requested ${ranges.length} range(s): ${ranges.map((r) => `${r.startRef}–${r.endRef}`).join(", ")}]`);
     ctx.log(`[acp-proxy: ctx has ${ctx.messages.length} message(s), state has ${ctx.session.state.messageRefs?.byRef?.size ?? "?"} ref(s) mapped]`);
@@ -105,7 +120,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         if (r.blocksCreated === 0) {
             const errs = r.errors.join("; ") || "no blocks created";
             ctx.log(`[acp-proxy: compress FAILED ${detail} → 0 blocks. ${errs}]`);
-        return `[Compression FAILED: ${errs}]`;
+        return `[Compression FAILED: ${errs}${compressibleSpanHint(ctx.session.state)}]`;
         }
 
         // #189 observability: record the rewrite magnitude + fold point so a

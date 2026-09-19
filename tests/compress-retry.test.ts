@@ -11,6 +11,7 @@ import {
     COMPRESS_TOOL_NAME,
 } from "../src/compress-tool.ts";
 import { stripFailedCompressCalls } from "../src/server.ts";
+import { compressibleSpanHint } from "../src/stream.ts";
 
 // #743: hosts pre-validate tool args against the served schema and reject a
 // missing `content` CLIENT-side, showing the model a bare "content: is
@@ -89,4 +90,16 @@ test("#743: history without a user message is returned unchanged", () => {
     const messages = [okCall("tc1"), failedResult("tc1")];
     const out = stripFailedCompressCalls(messages);
     assert.equal(out.length, 2);
+});
+
+// 01a0b0c4 (2026-09-18): every failed compress receipt must name the live
+// compressible span, so a model that anchors on refs an earlier fold consumed
+// recovers in one retry instead of loop-failing and giving up.
+test("failed compress receipts carry the live compressible span", () => {
+    const state = (refs: string[], blockEnds: (string | undefined)[]): CompressionState =>
+        ({ messageRefs: { byRef: Object.fromEntries(refs.map((r) => [r, r])), byRaw: {} }, blocks: blockEnds.map((endRef, i) => ({ endRef, active: true, blockId: `b${i}` })) }) as CompressionState;
+    const hint = compressibleSpanHint(state(["m05400", "m05448", "b104"], ["m05372"]));
+    assert.ok(hint.includes("m05373–m05448"), `hint names the span past the block boundary: ${hint}`);
+    const exhausted = compressibleSpanHint(state(["m05372"], ["m05372"]));
+    assert.ok(exhausted.includes("compress a run of ACTIVE blocks"), `hint falls back to block compression: ${exhausted}`);
 });
